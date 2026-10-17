@@ -13233,7 +13233,10 @@ namespace tsl {
     
 
     // Global state and event system
-    static inline Event notificationEvent;
+    // Main-loop wake events are user-space (UEvent): they need no kernel event objects. In the applet resource
+    // group (nx-ovlloader with program type Applet) svcCreateEvent fails, the wait got an invalid handle (0xE401)
+    // and the overlay could not hide or close.
+    static inline UEvent notificationEvent;
     static inline std::mutex notificationJsonMutex;
     static inline std::atomic<uint32_t> notificationGeneration{0};
 
@@ -13390,7 +13393,7 @@ namespace tsl {
                 }
             }
 
-            eventFire(&notificationEvent);
+            ueventSignal(&notificationEvent);
             #if IS_STATUS_MONITOR_DIRECTIVE
             if (isRendering) {
                 isRendering  = false;
@@ -14953,7 +14956,7 @@ namespace tsl {
         struct SharedThreadData {
             std::atomic<bool> running = false;
             
-            Event comboEvent = { 0 };
+            UEvent comboEvent{};
             
             std::atomic<bool> overlayOpen = false;
             
@@ -15008,7 +15011,7 @@ namespace tsl {
                 pendingExitPackage.store(true, std::memory_order_release);
                 ult::launchingOverlay.store(true, std::memory_order_release);
                 tsl::Overlay::get()->close();
-                eventFire(&shData->comboEvent);
+                ueventSignal(&shData->comboEvent);
                 launchComboHasTriggered.store(true, std::memory_order_release);
             };
             
@@ -15140,7 +15143,7 @@ namespace tsl {
                         switch (overlayAppletHandleMessage(appletMessage, open)) {
                             case OverlayAppletAction::Show:
                                 if (!open) {
-                                    eventFire(&shData->comboEvent);
+                                    ueventSignal(&shData->comboEvent);
                                     mainComboHasTriggered.store(true, std::memory_order_release);
                                 }
                                 break;
@@ -15152,7 +15155,7 @@ namespace tsl {
                                 break;
                             case OverlayAppletAction::Exit:
                                 tsl::Overlay::get()->close(true);
-                                eventFire(&shData->comboEvent);
+                                ueventSignal(&shData->comboEvent);
                                 break;
                             case OverlayAppletAction::None:
                                 break;
@@ -15161,7 +15164,7 @@ namespace tsl {
                     if (!exitHandled && overlayAppletExitRequested.load(std::memory_order_acquire)) {
                         exitHandled = true;
                         tsl::Overlay::get()->close(true);
-                        eventFire(&shData->comboEvent);
+                        ueventSignal(&shData->comboEvent);
                     }
                 }
             #endif
@@ -15520,11 +15523,11 @@ namespace tsl {
                                 // opening from the right edge. Default 0 = original bounds.
                                 const s32 swipeOff = ult::swipeOffset;
                                 if (ult::layerEdge == 0 && static_cast<s32>(currentTouch.x) > SWIPE_RIGHT_BOUND + 84 + swipeOff && static_cast<s32>(lastTouchX) <= SWIPE_RIGHT_BOUND + swipeOff) {
-                                    eventFire(&shData->comboEvent);
+                                    ueventSignal(&shData->comboEvent);
                                     mainComboHasTriggered.store(true, std::memory_order_release);
                                 }
                                 else if (ult::layerEdge > 0 && static_cast<s32>(currentTouch.x) < SWIPE_LEFT_BOUND - 84 - swipeOff && static_cast<s32>(lastTouchX) >= SWIPE_LEFT_BOUND - swipeOff) {
-                                    eventFire(&shData->comboEvent);
+                                    ueventSignal(&shData->comboEvent);
                                     mainComboHasTriggered.store(true, std::memory_order_release);
                                 }
                             }
@@ -15660,7 +15663,7 @@ namespace tsl {
                             }
                         }
                         else {
-                            eventFire(&shData->comboEvent);
+                            ueventSignal(&shData->comboEvent);
                             mainComboHasTriggered.store(true, std::memory_order_release);
                         }
                     }
@@ -15669,7 +15672,7 @@ namespace tsl {
                         std::swap(tsl::cfg::launchCombo, tsl::cfg::launchCombo2); // Swap the two launch combos
                         ult::setIniFileValue(ult::RYZHAND_CONFIG_INI_PATH, ult::RYZHAND_PROJECT_NAME, ult::KEY_COMBO_STR , ult::TESLA_COMBO_STR);
                         ult::setIniFileValue(ult::TESLA_CONFIG_INI_PATH, ult::TESLA_STR, ult::KEY_COMBO_STR , ult::TESLA_COMBO_STR);
-                        eventFire(&shData->comboEvent);
+                        ueventSignal(&shData->comboEvent);
                         mainComboHasTriggered.store(true, std::memory_order_release);
                         ult::updateMenuCombos = false;
                     }
@@ -16724,7 +16727,7 @@ namespace tsl {
         });
         overlay->initScreen();
 
-        eventCreate(&shData.comboEvent, false);
+        ueventCreate(&shData.comboEvent, false);
 
         Thread backgroundHapticsThread;
         threadCreate(&backgroundHapticsThread, impl::backgroundHapticsPoller, nullptr, nullptr, 0x1000, 0x2c, -2);
@@ -16804,7 +16807,7 @@ namespace tsl {
         
             // Fire event if needed
             if (shouldFireEvent) {
-                eventFire(&shData.comboEvent);
+                ueventSignal(&shData.comboEvent);
             } else {
                 lastOverlayFilename = "";
             }
@@ -16829,7 +16832,7 @@ namespace tsl {
         }
 
         if (skipCombo) {
-            eventFire(&shData.comboEvent);
+            ueventSignal(&shData.comboEvent);
             shouldFireEvent = true;
         }
     #endif
@@ -16838,7 +16841,6 @@ namespace tsl {
         overlay->disableNextAnimation();
         
         {
-            const Handle handles[2] = { shData.comboEvent.revent, notificationEvent.revent };
             s32 index = -1;
             
             bool exitAfterPrompt = false;
@@ -16871,20 +16873,20 @@ namespace tsl {
                 if (!(notification && notification->isActive())) {
                     {
                     #if IS_OVERLAY_APPLET_DIRECTIVE
-                        (void)handles;
                         while (shData.running.load(std::memory_order_acquire)) {
-                            if (overlayAppletEventSignaled(&shData.comboEvent))  { index = 0; break; }
-                            if (overlayAppletEventSignaled(&notificationEvent)) { index = 1; break; }
-                            svcSleepThread(10'000'000ULL);
+                            if (R_SUCCEEDED(waitMulti(&index, 10'000'000ULL, waiterForUEvent(&shData.comboEvent),
+                                                      waiterForUEvent(&notificationEvent))))
+                                break;
                         }
                         overlayAppletLog("wake", static_cast<Result>(index));
                     #else
-                        svcWaitSynchronization(&index, handles, 2, UINT64_MAX);
+                        waitMulti(&index, UINT64_MAX, waiterForUEvent(&shData.comboEvent),
+                                  waiterForUEvent(&notificationEvent));
                     #endif
                     }
                 }
-                eventClear(&notificationEvent);
-                eventClear(&shData.comboEvent);
+                ueventClear(&notificationEvent);
+                ueventClear(&shData.comboEvent);
                 
                 if ((notification && notification->isActive() && !firstLoop) || index == 1) {
                     comboBreakout = false;
@@ -17110,7 +17112,7 @@ namespace tsl {
                     hlp::requestForeground(false);
                     shData.overlayOpen.store(false, std::memory_order_release);
                     mainComboHasTriggered.store(false, std::memory_order_release);
-                    eventClear(&shData.comboEvent);
+                    ueventClear(&shData.comboEvent);
                 }
             }
 
@@ -17142,7 +17144,6 @@ namespace tsl {
             threadWaitForExit(&backgroundSoundThread);
             threadClose(&backgroundSoundThread);
             
-            eventClose(&shData.comboEvent);
     
             return 0;
         }
@@ -17275,7 +17276,7 @@ extern "C" {
         // spl and spsm are not needed by the quick menu. The overlay applet lives
         // for the whole session, and a session held here is one fewer for homebrew
         // such as Daybreak (sm OutOfSessions, 2021-0003, seen on 20.3.0).
-        eventCreate(&tsl::notificationEvent, false);
+        ueventCreate(&tsl::notificationEvent, false);
         tsl::notification = new tsl::NotificationPrompt();
         overlayAppletBootLog("done", 0);
         return;
@@ -17316,7 +17317,7 @@ extern "C" {
         *plSrv = plClone;
         #endif
 
-        eventCreate(&tsl::notificationEvent, false);
+        ueventCreate(&tsl::notificationEvent, false);
         tsl::notification = new tsl::NotificationPrompt();
     }
     
@@ -17326,7 +17327,6 @@ extern "C" {
      */
     void __appExit(void) {
         delete tsl::notification;
-        eventClose(&tsl::notificationEvent);
         ult::Audio::exit();
 
         spsmExit();
