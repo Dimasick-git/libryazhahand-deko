@@ -51,6 +51,7 @@ constexpr unsigned SwapImages = 2;
 // фон виден, текст на нём читается.
 constexpr u8 GlassBackgroundAlpha = 6;
 constexpr float GlassSaturation = 1.3f;            // размытие гасит цвет — вернуть
+constexpr float PanelGlassBrightness = 0.35f;      // стекло под подложками и таблицами — темнее, текст не просвечивает
 // Стекло: образ захвата (половина панели) и ступени вдвое меньше; размытие — вниз до последней и обратно (dual Kawase).
 constexpr unsigned BlurLevels = 4;
 // Первый кадр: оверлей не показывается без стекла. Подготовка видеочипа — 0.05–0.1 с, буфер дисплея по подсказке —
@@ -641,6 +642,7 @@ extern "C" void ryzGpuEnd(void) {
     params.misc[0] = g.haveFrame ? 1.0f : 0.0f;
     params.glass[0] = float(GlassBackgroundAlpha) / 15.0f;
     params.glass[1] = GlassSaturation;
+    params.glass[2] = PanelGlassBrightness;
     std::memcpy(g.paramMem.getCpuAddr(), &params, sizeof(params));
     if (g.haveFrame) {
         backdrop::refresh(g.frame);

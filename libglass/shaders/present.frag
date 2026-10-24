@@ -1,7 +1,7 @@
 #version 460
 
 // Кадр оверлея: интерфейс Tesla (буфер RGBA4, texelFetch) поверх размытого кадра игры (backdrop). Фон уже собран и
-// размыт видеочипом (backdrop_src.frag, затем blur_down/blur_up) и покрывает ровно область панели — отсюда выборка по
+// размыт видеочипом (capture.frag, затем blur_down/blur_up) и покрывает ровно область панели — отсюда выборка по
 // gl_FragCoord/размер панели, одна, с линейной фильтрацией.
 layout(location = 0) out vec4 outColor;
 layout(binding = 0) uniform sampler2D uiTex;       // интерфейс, 1:1
@@ -10,7 +10,7 @@ layout(binding = 1) uniform sampler2D backdrop;    // размытый кадр 
 layout(std140, binding = 0) uniform Params {
     vec4 panel;   // xy — 1/ширина, 1/высота панели
     vec4 misc;    // x — фон есть (0/1)
-    vec4 glass;   // x — альфа фона темы под стеклом (0..1), y — насыщенность размытого фона
+    vec4 glass;   // x — альфа фона темы под стеклом (0..1), y — насыщенность, z — яркость стекла под подложками
 };
 
 void main()
@@ -24,6 +24,10 @@ void main()
     // Размытие гасит насыщенность — вернуть её, как у стекла в системах с размытым фоном.
     const float luma = dot(b, vec3(0.299, 0.587, 0.114));
     b = clamp(mix(vec3(luma), b, glass.y), 0.0, 1.0);
+    // Подложки, таблицы и плашки Tesla рисует поверх фона темы — их альфа выше, чем у фона. Под ними стекло темнее:
+    // яркая игра не просвечивает сквозь подложку, и текст на ней читается.
+    const float element = smoothstep(glass.x + 0.03, glass.x + 0.25, ui.a);
+    b *= mix(1.0, glass.z, element);
     // Плавный фон в 8 битах даёт полосы — шум в полшага их разбивает.
     const float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
     b += (n - 0.5) * (1.0 / 255.0);
