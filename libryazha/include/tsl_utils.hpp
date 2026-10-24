@@ -500,6 +500,7 @@ namespace ult {
     // объявлены выше в upstream-блоке (v2.4.5) -- здесь только форк-строки.
     extern std::string LIBRYZHAND_TITLES;
     extern std::string LIBRYZHAND_VERSIONS;
+    extern std::string GLASS_BLUR;
 
     // Backported из vendored Ryzhand-Overlay -- TXT-читалка + UI-настройки
     // которые добавлялись там и были недоступны в base libryazhahand.

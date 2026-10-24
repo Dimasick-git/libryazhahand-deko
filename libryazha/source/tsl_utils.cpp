@@ -556,6 +556,7 @@ namespace ult {
     // остаются только наши форк-строки без дублей.
     std::string LIBRYZHAND_TITLES;
     std::string LIBRYZHAND_VERSIONS;
+    std::string GLASS_BLUR;
 
     // Backported из vendored Ryzhand-Overlay.
     std::string TXT_READER;
@@ -807,6 +808,7 @@ namespace ult {
         // записи в upstream-части таблицы выше (v2.4.5), дубли убраны.
         {&LIBRYZHAND_TITLES,        "LIBRYZHAND_TITLES",        "libryazhahand Titles"},
         {&LIBRYZHAND_VERSIONS,      "LIBRYZHAND_VERSIONS",      "libryazhahand Versions"},
+        {&GLASS_BLUR,               "GLASS_BLUR",               "GPU Blur"},
         // Backports из vendored Ryzhand-Overlay.
         {&TXT_READER,                 "TXT_READER",                 "TXT Reader"},
         {&NO_TXT_FILES_FOUND,         "NO_TXT_FILES_FOUND",         "No TXT files found"},

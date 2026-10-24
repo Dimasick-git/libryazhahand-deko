@@ -363,6 +363,30 @@ inline bool amsVersionAtLeast(uint8_t major, uint8_t minor, uint8_t patch) {
 
 inline bool requiresLNY2 = false;
 
+// Стекло (libglass, USING_GLASS_DIRECTIVE := 1 в Makefile оверлея): кадр выводит видеочип (deko3d), под интерфейсом —
+// живой размытый кадр игры или HOME. Оверлей без стекла этих функций не содержит — всё как раньше, через libnx.
+// Видеочип готовится в фоне (ryzGpuStart), первый кадр его ждёт; готов (ryzGpuReady) — на границе кадра Renderer
+// отпускает буфер libnx и отдаёт окно видеочипу (ryzGpuAttach), дальше рисует в его буфер с той же блочной раскладкой
+// RGBA4444. Видеочип перестал выводить кадры — ryzGpuBegin отдаёт nullptr, окно уже отпущено, Renderer снова создаёт
+// буфер libnx.
+extern "C" {
+    // В начале tsl::loop, до первого nvInitialize: запас памяти видеочипа и nvdrv.
+    void ryzGpuConfigure(void) __attribute__((weak));
+    // layerRect: экранная координата (0..1) угла слоя и её шаг на пиксель буфера.
+    void ryzGpuStart(NWindow* window, u32 width, u32 height, const float layerRect[4]) __attribute__((weak));
+    bool ryzGpuReady(void) __attribute__((weak));
+    bool ryzGpuAttach(NWindow* window, void** buffer, u32* bufferSize) __attribute__((weak));
+    // backgroundAlpha: альфа фона темы под стеклом (0..15) или 0xFF — фон темы как есть.
+    void* ryzGpuBegin(u8* backgroundAlpha) __attribute__((weak));
+    void ryzGpuEnd(void) __attribute__((weak));
+    void ryzGpuExit(void) __attribute__((weak));
+    // Конец __appExit: память, взятая сверх кучи оверлея, — обратно системе.
+    void ryzAfterAppExit(void) __attribute__((weak));
+    // Стекло на лету (переключатель «Размытие GPU» в меню; ключ glass_blur в config/ryazhahand/config.ini): выключено —
+    // кадр без размытия, фон темы как есть. Включить на лету можно, только если оверлей запущен со стеклом.
+    void ryzGlassSetEnabled(bool on) __attribute__((weak));
+}
+
 
 namespace tsl {
 
@@ -5269,6 +5293,9 @@ namespace tsl {
             }
             
             bool m_initialized = false;
+            bool m_gpu = false;          // кадр через видеочип (стекло)
+            bool m_glassBackground = false;
+            u8 m_themeBackgroundAlpha = 0xF;
             ViDisplay m_display;
             ViLayer m_layer;
             Event m_vsyncEvent;
@@ -5509,6 +5536,13 @@ namespace tsl {
                     TSL_LAYER_SETUP(viSetLayerPosition(&this->m_layer, cfg::LayerPosX, cfg::LayerPosY));
                     TSL_VI_REQUIRE("window", nwindowCreateFromLayer(&this->m_window, &this->m_layer));
                     TSL_VI_REQUIRE("fb", framebufferCreate(&this->m_framebuffer, &this->m_window, cfg::FramebufferWidth, cfg::FramebufferHeight, PIXEL_FORMAT_RGBA_4444, 2));
+                    if (ryzGpuStart) {
+                        const float sw = float(cfg::ScreenWidth), sh = float(cfg::ScreenHeight);
+                        const float layerRect[4] = { float(cfg::LayerPosX) / sw, float(cfg::LayerPosY) / sh,
+                                                     float(cfg::LayerWidth) / (float(cfg::FramebufferWidth) * sw),
+                                                     float(cfg::LayerHeight) / (float(cfg::FramebufferHeight) * sh) };
+                        ryzGpuStart(&this->m_window, cfg::FramebufferWidth, cfg::FramebufferHeight, layerRect);
+                    }
                     TSL_VI_REQUIRE("set", setInitialize());
                     TSL_VI_REQUIRE("fonts", this->initFonts());
                     setExit();
@@ -5528,7 +5562,11 @@ namespace tsl {
                 // Cleanup shared font manager
                 FontManager::cleanup();
 
-                framebufferClose(&this->m_framebuffer);
+                // Сначала видеочип: дождаться фоновой подготовки и снести его объекты, пока nvdrv ещё открыт.
+                if (ryzGpuExit)
+                    ryzGpuExit();
+                if (!this->m_gpu)
+                    framebufferClose(&this->m_framebuffer);
                 nwindowClose(&this->m_window);
                 viDestroyManagedLayer(&this->m_layer);
                 viCloseDisplay(&this->m_display);
@@ -5618,7 +5656,49 @@ namespace tsl {
              * @warning Don't call this more than once before calling \ref endFrame
              */
             inline void startFrame() {
+                // Видеочип готов — окно переходит к нему между кадрами: буфер libnx отпущен, дальше рисуем в буфер
+                // видеочипа. Не вышло — снова буфер libnx.
+                if (!this->m_gpu && ryzGpuReady && ryzGpuReady()) {
+                    framebufferClose(&this->m_framebuffer);
+                    void* gpuBuffer = nullptr;
+                    u32 gpuBufferSize = 0;
+                    if (ryzGpuAttach(&this->m_window, &gpuBuffer, &gpuBufferSize)) {
+                        this->m_gpu = true;
+                        this->m_framebuffer = {};
+                        this->m_framebuffer.buf = gpuBuffer;
+                        this->m_framebuffer.fb_size = gpuBufferSize;
+                        this->m_framebuffer.num_fbs = 1;
+                    } else {
+                        ASSERT_FATAL(framebufferCreate(&this->m_framebuffer, &this->m_window, cfg::FramebufferWidth, cfg::FramebufferHeight, PIXEL_FORMAT_RGBA_4444, 2));
+                    }
+                }
+                if (this->m_gpu) {
+                    u8 backgroundAlpha = 0xFF;
+                    this->m_currentFramebuffer = ryzGpuBegin(&backgroundAlpha);
+                    this->setGlassBackground(this->m_currentFramebuffer ? backgroundAlpha : 0xFF);
+                    if (this->m_currentFramebuffer)
+                        return;
+                    // Видеочип перестал выводить кадры и уже отпустил окно — дальше снова буфер libnx.
+                    this->m_gpu = false;
+                    ASSERT_FATAL(framebufferCreate(&this->m_framebuffer, &this->m_window, cfg::FramebufferWidth, cfg::FramebufferHeight, PIXEL_FORMAT_RGBA_4444, 2));
+                }
                 this->m_currentFramebuffer = framebufferBegin(&this->m_framebuffer, nullptr);
+            }
+
+            // Фон темы под стеклом полупрозрачный (alpha 0..15), без стекла — прежний из темы. Каждый кадр до отрисовки:
+            // перечитанная тема вернула бы непрозрачный фон.
+            inline void setGlassBackground(u8 alpha) {
+                Color& bg = tsl::defaultBackgroundColor;
+                if (alpha <= 0xF) {
+                    if (bg.a != alpha) {
+                        this->m_themeBackgroundAlpha = bg.a;
+                        bg.a = alpha;
+                    }
+                    this->m_glassBackground = true;
+                } else if (this->m_glassBackground) {
+                    bg.a = this->m_themeBackgroundAlpha;
+                    this->m_glassBackground = false;
+                }
             }
 
             inline void endFrame() {
@@ -5639,7 +5719,10 @@ namespace tsl {
             #endif
             
                 this->waitForVSync();
-                framebufferEnd(&this->m_framebuffer);
+                if (this->m_gpu)
+                    ryzGpuEnd();
+                else
+                    framebufferEnd(&this->m_framebuffer);
                 this->m_currentFramebuffer = nullptr;
             
                 if (tsl::clearGlyphCacheNow.exchange(false, std::memory_order_acq_rel)) {
@@ -16502,6 +16585,10 @@ namespace tsl {
     static inline int loop(int argc, char** argv) {
         static_assert(std::is_base_of_v<tsl::Overlay, TOverlay>, "tsl::loop expects a type derived from tsl::Overlay");
 
+        // Стекло: запас памяти видеочипа и nvdrv — до первого nvInitialize (framebufferCreate в Renderer::init).
+        if (ryzGpuConfigure)
+            ryzGpuConfigure();
+
     #if IS_STATUS_MONITOR_DIRECTIVE
         leventClear(&renderingStopEvent);
         // Status monitor will load heap settings directly in main, so bypass here in loop
@@ -17351,6 +17438,10 @@ extern "C" {
 
         // Final cleanup
         tsl::gfx::FontManager::cleanup();
+
+        // Стекло: после всех free — память, которую оверлей брал сверх своей кучи, обратно системе.
+        if (ryzAfterAppExit)
+            ryzAfterAppExit();
     }
 
 }
