@@ -542,6 +542,7 @@ extern "C" void ryzDkMessage(const char* message) { log("deko3d: %s", message); 
 extern "C" void ryzGpuConfigure(void) { configure(); }
 
 extern "C" void ryzGlassSetEnabled(bool on) { g_enabled.store(on, std::memory_order_relaxed); }
+extern "C" bool ryzGlassBackdropReady(void) { return g.haveFrame && !g.lost; }
 
 extern "C" void ryzGpuStart(NWindow*, u32 width, u32 height, const float layerRect[4]) {
     if (!g.configured || g_job.started) return;
