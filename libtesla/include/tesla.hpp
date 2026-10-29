@@ -13319,9 +13319,12 @@ namespace tsl {
     // Main-loop wake events are user-space (UEvent): they need no kernel event objects. In the applet resource
     // group (nx-ovlloader with program type Applet) svcCreateEvent fails, the wait got an invalid handle (0xE401)
     // and the overlay could not hide or close.
-    static inline UEvent notificationEvent;
-    static inline std::mutex notificationJsonMutex;
-    static inline std::atomic<uint32_t> notificationGeneration{0};
+    // These objects must be shared by __appInit, the main loop and notification
+    // producers in every translation unit. Internal linkage creates separate
+    // UEvents: show() can then signal a zero-initialized waiter list and crash.
+    inline UEvent notificationEvent;
+    inline std::mutex notificationJsonMutex;
+    inline std::atomic<uint32_t> notificationGeneration{0};
 
     // Max notifications cap (max value of 4 on limited memory, 8 otherwise)
     extern int maxNotifications;
