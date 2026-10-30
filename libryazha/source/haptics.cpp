@@ -20,6 +20,19 @@
 
 #include "haptics.hpp"
 
+// Switch Lite has no motors: Ryzhand renders menu clicks through the speakers.
+// Only builds that ship lite_vibration.hpp (Ryzhand, emulation branch) get it.
+#if __has_include("lite_vibration.hpp")
+#include "lite_vibration.hpp"
+static void liteInit() { ryz::lite_haptics::Initialize(); }
+static void liteExit() { ryz::lite_haptics::Exit(); }
+static void liteClick(u32 clicks) { ryz::lite_haptics::Trigger(clicks); }
+#else
+static void liteInit() {}
+static void liteExit() {}
+static void liteClick(u32) {}
+#endif
+
 namespace ult {
 
     // ===== Internal state =====
@@ -80,6 +93,7 @@ namespace ult {
 
     // ===== Public API =====
     void initHaptics() {
+        liteInit();
         const u32 handheldStyle = hidGetNpadStyleSet(HidNpadIdType_Handheld);
         const u32 player1Style  = hidGetNpadStyleSet(HidNpadIdType_No1);
 
@@ -107,6 +121,7 @@ namespace ult {
 
     void deinitHaptics() {
         sendVibration(&vibrationStop);
+        liteExit();
     }
 
     void checkAndReinitHaptics() {
@@ -126,6 +141,7 @@ namespace ult {
     }
 
     void rumbleClickStandalone() {
+        liteClick(1);
         const HidVibrationValue& preset = getHapticsPreset();
         sendVibration(&vibrationStop);
         //sendVibration(&preset);
@@ -135,6 +151,7 @@ namespace ult {
     }
 
     void rumbleDoubleClickStandalone() {
+        liteClick(2);
         const HidVibrationValue& preset = getHapticsPreset();
         sendVibration(&vibrationStop);
         //sendVibration(&preset);
