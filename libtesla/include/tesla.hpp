@@ -380,6 +380,7 @@ extern "C" {
     void* ryzGpuBegin(u8* backgroundAlpha) __attribute__((weak));
     void ryzGpuEnd(void) __attribute__((weak));
     void ryzGpuExit(void) __attribute__((weak));
+    void ryzGlassLogQuiet(void) __attribute__((weak));
     // Конец __appExit: память, взятая сверх кучи оверлея, — обратно системе.
     void ryzAfterAppExit(void) __attribute__((weak));
     // Стекло на лету (переключатель «Размытие GPU» в меню; ключ glass_blur в config/ryazhahand/config.ini): выключено —
@@ -17421,6 +17422,8 @@ extern "C" {
 
         spsmExit();
         splExit();
+        if (ryzGlassLogQuiet)
+            ryzGlassLogQuiet();   // фоновые потоки стекла больше не пишут на карту — её сейчас отмонтируют
         fsdevUnmountAll();
         
         #if USING_WIDGET_DIRECTIVE

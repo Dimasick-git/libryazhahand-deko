@@ -466,8 +466,16 @@ ryz::glass::Affine captureMap(const backdrop::Frame& f) {
 
 }  // namespace
 
+/* Журнал молчит с выхода оверлея: фоновые потоки стекла (поиск буфера дисплея, подготовка) писали в него, когда
+ * __appExit уже отмонтировал карту, — fclose падал в _close_r (Data Abort 0x18 в ovlloader, 08.11). */
+bool g_logQuiet = false;
+
 void log(const char* fmt, ...) {
     mutexLock(&g_logMutex);
+    if (g_logQuiet || !fsdevGetDeviceFileSystem("sdmc")) {
+        mutexUnlock(&g_logMutex);
+        return;
+    }
     if (FILE* f = std::fopen(LogPath, "a")) {
         std::fprintf(f, "[%6llu ms] ", (unsigned long long)nowMs());
         va_list args;
@@ -674,6 +682,13 @@ extern "C" void ryzGpuEnd(void) {
     g.queue.presentImage(g.swapchain, slot);
     g.inFlight = true;
     ++g.frames;
+}
+
+// Зовётся из __appExit до fsdevUnmountAll: дальше журнал на карту не пишется.
+extern "C" void ryzGlassLogQuiet(void) {
+    mutexLock(&ryz::glass::g_logMutex);
+    ryz::glass::g_logQuiet = true;
+    mutexUnlock(&ryz::glass::g_logMutex);
 }
 
 extern "C" void ryzGpuExit(void) {
