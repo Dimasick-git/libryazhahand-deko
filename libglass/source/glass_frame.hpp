@@ -29,6 +29,22 @@ struct DirectFrame {
     bool overlayFound = false;
 };
 
+// Only a still-separate, unchanged hardware plane can supply a live frame.
+// Address is intentionally separate: it may advance within the same nvmap pool.
+inline bool windowMappingMatches(const DcWindow& w, const volatile uint32_t* regs) {
+    if (w.index > 2) return false;
+    const unsigned c = 0xb80 + w.index * 0x200, b = 0xbc0 + w.index * 0x200;
+    const uint32_t pre = regs[c + 6], pos = regs[c + 4], extent = regs[c + 5], kind = regs[b + 11];
+    return ((kind & 3) == 0 || (kind & 3) == 2) && (regs[c] & 0x40000000) && regs[c] == w.options &&
+           regs[c + 3] == w.format && (pre & 0x7fff) / 4 == w.srcX && (pre >> 16) == w.srcY &&
+           (pos & 0x1fff) == w.x && ((pos >> 16) & 0x1fff) == w.y &&
+           (extent & 0x1fff) == w.extentX && ((extent >> 16) & 0x1fff) == w.extentY &&
+           (regs[c + 10] & 0xffff) == w.pitch && (regs[c + 0x16] & 255) == w.depth &&
+           int32_t(regs[b + 6] / 4) == w.originX && int32_t(regs[b + 8]) == w.originY &&
+           (((kind & 3) == 2 ? ((kind >> 4) & 7) + 1 : 0) == w.blockHeight) &&
+           !(regs[b + 0x2f] & 1) && !regs[c + 1];
+}
+
 // Аффинное отображение плоскости: out = (m[0]*x + m[1]*y + m[2], m[3]*x + m[4]*y + m[5]).
 struct Affine {
     float m[6] = { 1, 0, 0, 0, 1, 0 };

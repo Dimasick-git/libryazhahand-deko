@@ -24,6 +24,6 @@ void frameShown();
 bool latest(Frame& out);
 // Перед кадром: адрес буфера, который дисплей показывает сейчас. Поток публикует раз в ~8 мс — за это время дисплей
 // успевает перелистнуть, и без перечитывания стекло брало бы недорисованный задний буфер.
-void refresh(Frame& frame);
+bool refresh(Frame& frame);
 
 }  // namespace ryz::glass::backdrop

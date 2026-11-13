@@ -20,6 +20,22 @@ constexpr unsigned IdsPerCall = 32;
 constexpr unsigned NeighborSpan = 16;       // соседние номера: буферы одного свопчейна создаются подряд
 constexpr unsigned CeilingEvery = 240;      // раз в столько промахов — свежий верх поиска
 
+Mutex g_dcReadMutex;
+
+// Регистры контроллера дисплея стекло ТОЛЬКО ЧИТАЕТ. Переключать DC_CMD_STATE_ACCESS (READ_MUX, слово 0x40), чтобы
+// читать активный банк вместо очереди, нельзя: этот бит общий с системным драйвером дисплея, и его чтение-правка-запись
+// окна в тот миг, когда бит переключён нами, берёт активные значения вместо очереди и откатывает ждущее обновление окна
+// — слой (оверлей, Ryzhand) мигал на кадр, и чаще всего под размытием (13.11: мерцал весь интерфейс). Буфер в очереди —
+// кадр, уже готовый к показу: окно перепрограммируют только после его метки. Чтение — двойное (ниже сверяется
+// повторным чтением), а оба наших потока читают по очереди — так снимок одного окна не перемешивается.
+class DcReadGuard {
+public:
+    DcReadGuard() { mutexLock(&g_dcReadMutex); }
+    ~DcReadGuard() { mutexUnlock(&g_dcReadMutex); }
+    DcReadGuard(const DcReadGuard&) = delete;
+    DcReadGuard& operator=(const DcReadGuard&) = delete;
+};
+
 // Чтение регистра MC через exosphere (smcReadWriteRegister с маской 0 — только чтение).
 bool readSmc(uintptr_t address, uint32_t& value) {
     SecmonArgs args{};
@@ -79,6 +95,7 @@ bool DirectCapture::initialize(uint32_t firstOwnId, uint32_t latestOwnId, void* 
     }
     misses_ = 0;
     ready_ = true;
+    glass::log("glass: DC scanout capture, registers read-only");
     return true;
 }
 
@@ -95,6 +112,7 @@ bool DirectCapture::readFrame(DirectFrame& result) {
         uint32_t dcCfg = 0;
         if (!readSmc(controller ? 0x70019244 : 0x70019240, dcCfg) || (dcCfg & 0x800000ff) != (vicCfg & 0x800000ff))
             continue;
+        DcReadGuard guard;
         if (!(regs[0x032] & 0x60)) continue;
         const uint32_t active = regs[0x409];
         const uint32_t sw = active & 0x1fff, sh = (active >> 16) & 0x1fff;
@@ -165,6 +183,11 @@ bool DirectCapture::readFrame(DirectFrame& result) {
             frame.overlay = windows[overlay];
             frame.overlayFound = true;
         }
+        // With HOME + another system layer the compositor may flatten our own
+        // layer into its output. Without a separate overlay plane that output
+        // can contain us; feeding it back into glass creates rapid flickering.
+        // Keep the last GPU blur until a separate overlay plane is visible again.
+        if (overlay < 0) continue;
         // Сцена — самая задняя из остальных (больше depth — дальше от зрителя), при равенстве — больше площадь.
         bool haveScene = false;
         for (unsigned i = 0; i < 3; ++i) {
@@ -331,8 +354,17 @@ bool DirectCapture::refreshAddress(DirectFrame& f) const {
     if (!ready_ || !f.id || f.scene.controller > 1 || f.scene.index > 2) return false;
     auto* regs = dc_[f.scene.controller];
     if (!regs || !clocks_ || !(clocks_[4] & (1u << (f.scene.controller ? 26 : 27)))) return false;
+    DcReadGuard guard;
+    // A DC window index is not a persistent surface identity. HOME can reuse
+    // that index for a different plane between capture-thread publications.
+    // Validate the whole mapping before following even an unchanged address.
+    if (!f.overlayFound || f.overlay.controller != f.scene.controller || f.overlay.index > 2) return false;
+    if (!windowMappingMatches(f.scene, regs) || !windowMappingMatches(f.overlay, regs)) return false;
     const unsigned buffer = 0xbc0 + f.scene.index * 0x200;
     const uint64_t address = uint64_t(regs[buffer]) | (uint64_t(regs[buffer + 13]) << 32);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!windowMappingMatches(f.scene, regs) || !windowMappingMatches(f.overlay, regs) ||
+        uint32_t(address) != regs[buffer] || uint32_t(address >> 32) != regs[buffer + 13]) return false;
     if (address == f.scene.address) return true;
     // Другой буфер nvmap (свопчейн из отдельных буферов) — остаётся прежний, его найдёт поток.
     if (address < f.base || address - f.base >= f.allocationBytes) return false;

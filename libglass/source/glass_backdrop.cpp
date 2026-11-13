@@ -129,8 +129,8 @@ void frameShown() {
     if (!prev || armTicksToNs(now - prev) > IdleNs) g_shownTick.store(now, std::memory_order_release);
 }
 
-void refresh(Frame& frame) {
-    if (g_started) g_capture.refreshAddress(frame);
+bool refresh(Frame& frame) {
+    return g_started && g_capture.refreshAddress(frame);
 }
 
 bool latest(Frame& out) {

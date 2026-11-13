@@ -130,6 +130,10 @@ struct State {
     // Фон: кадр дисплея этого кадра оверлея, импорт его буфера и список захвата под этот буфер.
     backdrop::Frame frame{};
     bool haveFrame = false;
+    bool cachedBlur = false;
+    bool captureThisFrame = false;
+    bool capturePaused = false;
+    unsigned captureChanges = 0;
     DkMemBlock source = nullptr;
     u32 sourceId = 0;
     DkCmdList captureList = 0;
@@ -149,6 +153,7 @@ struct InitJob {
 
 void destroy() {
     backdrop::stop();
+    g.haveFrame = g.cachedBlur = g.captureThisFrame = false;
     for (auto& l : g.lists) l = 0;
     g.captureList = 0;
     if (g.swapchain) g.swapchain.destroy();
@@ -495,8 +500,9 @@ void configure() {
         return;
     }
     // «Размытие GPU» выключено в настройках темы меню — оверлей как без стекла: кадры через libnx.
-    if (ult::parseValueFromIniSection(ult::RYZHAND_CONFIG_INI_PATH, ult::RYZHAND_PROJECT_NAME, "glass_blur") == "false")
-        return;
+    const bool requested = ult::parseValueFromIniSection(ult::RYZHAND_CONFIG_INI_PATH, ult::RYZHAND_PROJECT_NAME, "glass_blur") != "false";
+    g_enabled.store(requested, std::memory_order_relaxed);
+    if (!requested) return;
     const u32 width = ult::DefaultFramebufferWidth ? ult::DefaultFramebufferWidth : 448;
     const u32 height = ult::DefaultFramebufferHeight ? ult::DefaultFramebufferHeight : 720;
     const std::size_t extra = heap::reserve(gpuBytesFor(width, height));
@@ -551,6 +557,7 @@ extern "C" void ryzGpuConfigure(void) { configure(); }
 
 extern "C" void ryzGlassSetEnabled(bool on) { g_enabled.store(on, std::memory_order_relaxed); }
 extern "C" bool ryzGlassBackdropReady(void) { return g.haveFrame && !g.lost; }
+extern "C" bool ryzGlassIsEnabled(void) { return g_enabled.load(std::memory_order_relaxed); }
 
 extern "C" void ryzGpuStart(NWindow*, u32 width, u32 height, const float layerRect[4]) {
     if (!g.configured || g_job.started) return;
@@ -631,7 +638,15 @@ extern "C" void* ryzGpuBegin(u8* backgroundAlpha) {
         while (!backdrop::latest(g.frame) && armTicksToNs(armGetSystemTick() - holdStart) < HoldBackdropNs)
             svcSleepThread(2'000'000);
     }
-    g.haveFrame = g_enabled.load(std::memory_order_relaxed) && backdrop::latest(g.frame) && ensureSource(g.frame);
+    backdrop::Frame candidate;
+    g.captureThisFrame = g_enabled.load(std::memory_order_relaxed) && backdrop::latest(candidate) &&
+                         backdrop::refresh(candidate) && ensureSource(candidate);
+    if (g.captureThisFrame) g.frame = candidate;
+    const bool paused = g.cachedBlur && !g.captureThisFrame;
+    if (paused != g.capturePaused && g.captureChanges++ < 8)
+        log(paused ? "glass: capture paused (plane changed), keeping last GPU blur" : "glass: live capture resumed");
+    g.capturePaused = paused;
+    g.haveFrame = g_enabled.load(std::memory_order_relaxed) && (g.captureThisFrame || g.cachedBlur);
     // Стекло решается до отрисовки: Tesla рисует фон темы с этой альфой, шейдер кладёт его на размытый кадр игры.
     *backgroundAlpha = g.haveFrame ? GlassBackgroundAlpha : 0xFF;
     return g.uiMem.getCpuAddr();
@@ -645,6 +660,8 @@ extern "C" void ryzGpuEnd(void) {
     }
     g.uiMem.flushCpuCache(0, g.uiBytes);
     // Параметры: видеочип прошлый кадр закончил (ryzGpuBegin), блоки некэшируемые — пишутся сразу.
+    if (g.captureThisFrame && !backdrop::refresh(g.frame)) g.captureThisFrame = false;
+    g.haveFrame = g_enabled.load(std::memory_order_relaxed) && (g.captureThisFrame || g.cachedBlur);
     Params params{};
     params.panel[0] = 1.0f / float(g_job.width);
     params.panel[1] = 1.0f / float(g_job.height);
@@ -653,8 +670,7 @@ extern "C" void ryzGpuEnd(void) {
     params.glass[1] = GlassSaturation;
     params.glass[2] = PanelGlassBrightness;
     std::memcpy(g.paramMem.getCpuAddr(), &params, sizeof(params));
-    if (g.haveFrame) {
-        backdrop::refresh(g.frame);
+    if (g.captureThisFrame) {
         const backdrop::Frame& f = g.frame;
         const ryz::glass::Affine m = captureMap(f);
         s32 minX, minY, maxX, maxY;
@@ -674,7 +690,10 @@ extern "C" void ryzGpuEnd(void) {
         return;
     }
     // Сначала фон из буфера дисплея (живой, каждый кадр), потом композит интерфейса поверх него.
-    if (g.haveFrame && g.captureList) g.queue.submitCommands(g.captureList);
+    if (g.captureThisFrame && g.captureList) {
+        g.queue.submitCommands(g.captureList);
+        g.cachedBlur = true;
+    }
     g.queue.submitCommands(g.lists[slot]);
     // Метка конца переноса — до вывода: presentImage отправляет видеочипу всё накопленное, и её тоже. Поставленная
     // после вывода, она ушла бы только со следующим кадром.
