@@ -54,7 +54,17 @@ private:
     uint64_t lastAddress_ = 0;
     bool ready_ = false;
     void* censusStorage_ = nullptr;
+    // Что окно сейчас ПОКАЗЫВАЕТ (активный банк), выведенное без READ_MUX, — см. shownAddress. Оба потока читают
+    // под общим замком (DcReadGuard), поэтому состояние общее.
+    struct Shown {
+        uint64_t queued = 0, shown = 0;
+        uint32_t signature = 0;
+        bool known = false;
+    };
+    mutable Shown shown_[2][3]{};
 
+    uint64_t shownAddress(unsigned controller, unsigned index, uint64_t queued, uint32_t signature,
+                          const volatile uint32_t* regs) const;
     bool readFrame(DirectFrame&);
     bool matchKept(DirectFrame&);
     bool tryId(uint32_t id, DirectFrame&);

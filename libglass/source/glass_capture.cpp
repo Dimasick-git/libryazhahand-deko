@@ -49,7 +49,38 @@ bool readSmc(uintptr_t address, uint32_t& value) {
 
 bool sceneFormat(uint32_t f) { return f == 12 || f == 13 || f == 37 || f == 38; }
 
+// Окно для сверки: тот же слой, пока не сменились режим, формат и размер источника.
+uint32_t windowSignature(const DcWindow& w) { return w.options ^ (w.format << 8) ^ (w.srcX << 16) ^ w.srcY; }
+
 }  // namespace
+
+// АДРЕС, КОТОРЫЙ ОКНО ПОКАЗЫВАЕТ, А НЕ ТОТ, ЧТО ЖДЁТ В ОЧЕРЕДИ, — БЕЗ ПЕРЕКЛЮЧЕНИЯ READ_MUX. Чтение без READ_MUX даёт
+// банк сборки: новый адрес встаёт туда раньше, чем его покажут, и 13.11 на OLED стекло хватало ещё не показанный кадр
+// (меню мерцало). Защёлка окна ждёт, пока в DC_CMD_STATE_CONTROL (слово 0x41) стоит его WIN_x_ACT_REQ или
+// GENERAL_ACT_REQ; аппарат снимает бит на защёлке, а регистр только читается. Не ждёт — очередь и показ совпадают. Ждёт —
+// показан прежний адрес очереди: последний, что был в ней до нового. 0 — показанный ещё не известен, этот раз пропустить.
+uint64_t DirectCapture::shownAddress(unsigned controller, unsigned index, uint64_t queued, uint32_t signature,
+                                     const volatile uint32_t* regs) const {
+    Shown& s = shown_[controller & 1][index % 3];
+    if (s.signature != signature) {   // другой слой в этом окне: прежняя история к нему не относится
+        s = Shown{};
+        s.signature = signature;
+    }
+    const uint32_t waiting = regs[0x41] & (1u | (1u << (1 + index % 3)));
+    if (!waiting) {
+        s.queued = s.shown = queued;
+        s.known = true;
+        return queued;
+    }
+    if (queued != s.queued) {
+        if (s.queued) {
+            s.shown = s.queued;
+            s.known = true;
+        }
+        s.queued = queued;
+    }
+    return s.known ? s.shown : 0;
+}
 
 bool DirectCapture::initialize(uint32_t firstOwnId, uint32_t latestOwnId, void* censusStorage, uint32_t overlayWidth,
                                uint32_t overlayHeight, const uint32_t* hints, unsigned hintCount) {
@@ -95,7 +126,7 @@ bool DirectCapture::initialize(uint32_t firstOwnId, uint32_t latestOwnId, void* 
     }
     misses_ = 0;
     ready_ = true;
-    glass::log("glass: DC scanout capture, registers read-only");
+    glass::log("glass: DC scanout capture, registers read-only, shown frame by the latch request");
     return true;
 }
 
@@ -174,6 +205,9 @@ bool DirectCapture::readFrame(DirectFrame& result) {
             if (!w.srcX || !w.srcY || !w.extentX || !w.extentY) continue;
             if (!sceneFormat(w.format) || w.srcX < 64 || w.srcY < 64) continue;
             if (w.extentX < sw * 3 / 4 || w.extentY < sh * 3 / 4) continue;
+            // Из очереди — в то, что на экране.
+            windows[i].address = shownAddress(controller, i, w.address, windowSignature(w), regs);
+            if (!windows[i].address) continue;
             sceneLike[i] = true;
         }
         int overlay = -1;
@@ -361,10 +395,12 @@ bool DirectCapture::refreshAddress(DirectFrame& f) const {
     if (!f.overlayFound || f.overlay.controller != f.scene.controller || f.overlay.index > 2) return false;
     if (!windowMappingMatches(f.scene, regs) || !windowMappingMatches(f.overlay, regs)) return false;
     const unsigned buffer = 0xbc0 + f.scene.index * 0x200;
-    const uint64_t address = uint64_t(regs[buffer]) | (uint64_t(regs[buffer + 13]) << 32);
+    const uint64_t queued = uint64_t(regs[buffer]) | (uint64_t(regs[buffer + 13]) << 32);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!windowMappingMatches(f.scene, regs) || !windowMappingMatches(f.overlay, regs) ||
-        uint32_t(address) != regs[buffer] || uint32_t(address >> 32) != regs[buffer + 13]) return false;
+        uint32_t(queued) != regs[buffer] || uint32_t(queued >> 32) != regs[buffer + 13]) return false;
+    const uint64_t address = shownAddress(f.scene.controller, f.scene.index, queued, windowSignature(f.scene), regs);
+    if (!address) return false;
     if (address == f.scene.address) return true;
     // Другой буфер nvmap (свопчейн из отдельных буферов) — остаётся прежний, его найдёт поток.
     if (address < f.base || address - f.base >= f.allocationBytes) return false;
