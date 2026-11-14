@@ -54,10 +54,16 @@ uint32_t windowSignature(const DcWindow& w) { return w.options ^ (w.format << 8)
 
 }  // namespace
 
+// Между двумя взглядами короче этого дисплей защёлкивает окно не больше одного раза: кадр длиннее и на 140 Гц.
+constexpr uint64_t OneLatchNs = 7'000'000;
+
 // Адрес, который окно показывает, а не тот, что ждёт в очереди, — без READ_MUX. Чтение без READ_MUX даёт банк сборки,
 // где новый адрес стоит раньше, чем его покажут. Защёлка окна ждёт, пока в DC_CMD_STATE_CONTROL (слово 0x41) стоит его
 // WIN_x_ACT_REQ или GENERAL_ACT_REQ; аппарат снимает бит на защёлке, регистр только читается. Не ждёт — очередь и показ
-// совпадают. Ждёт — показан прежний адрес очереди. 0 — показанный ещё не известен, этот раз пропустить.
+// совпадают. Ждёт — показан прежний адрес очереди, но только если с прошлого взгляда прошло меньше кадра: иначе дисплей
+// мог защёлкнуть два кадра, и «прежний адрес очереди» — буфер, который игра уже рисует заново (в стекле — недорисованный
+// кадр, оно мерцает; так было на OLED, когда поток захвата опаздывал). Тогда показанный неизвестен, пока окно не перестанет
+// ждать или очередь не сменится при свежем взгляде. 0 — показанный неизвестен, этот раз пропустить.
 uint64_t DirectCapture::shownAddress(unsigned controller, unsigned index, uint64_t queued, uint32_t signature,
                                      const volatile uint32_t* regs) const {
     Shown& s = shown_[controller & 1][index % 3];
@@ -65,11 +71,20 @@ uint64_t DirectCapture::shownAddress(unsigned controller, unsigned index, uint64
         s = Shown{};
         s.signature = signature;
     }
+    const uint64_t now = armGetSystemTick();
+    const bool fresh = s.seenTick && armTicksToNs(now - s.seenTick) < OneLatchNs;
+    s.seenTick = now;
     const uint32_t waiting = regs[0x41] & (1u | (1u << (1 + index % 3)));
     if (!waiting) {
         s.queued = s.shown = queued;
         s.known = true;
         return queued;
+    }
+    if (!fresh) {
+        if (s.known) ++ambiguous_;
+        s.known = false;
+        s.queued = queued;
+        return 0;
     }
     if (queued != s.queued) {
         if (s.queued) {
@@ -206,7 +221,10 @@ bool DirectCapture::readFrame(DirectFrame& result) {
             if (w.extentX < sw * 3 / 4 || w.extentY < sh * 3 / 4) continue;
             // Из очереди — в то, что на экране.
             windows[i].address = shownAddress(controller, i, w.address, windowSignature(w), regs);
-            if (!windows[i].address) continue;
+            if (!windows[i].address) {
+                shownUnknown_ = true;
+                continue;
+            }
             sceneLike[i] = true;
         }
         int overlay = -1;
@@ -240,6 +258,7 @@ bool DirectCapture::readFrame(DirectFrame& result) {
                 frame.overlay = lastOverlay_;
                 frame.overlayFound = true;
             }
+            shownUnknown_ = false;
             result = frame;
             return true;
         }

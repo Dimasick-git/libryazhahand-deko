@@ -21,6 +21,10 @@ public:
     // регистры окна (без SMC) — дёшево, каждый кадр.
     bool refreshAddress(DirectFrame&) const;
     void close();
+    // Показанный адрес окна сцены сейчас неизвестен (см. shownAddress): поток захвата смотрит чаще, пока не узнает.
+    bool shownUnknown() const { return shownUnknown_; }
+    // Сколько раз дисплей мог защёлкнуть больше одного кадра между двумя взглядами — кадр тогда пропущен.
+    uint32_t ambiguousLatches() const { return ambiguous_; }
 
 private:
     struct Pin {
@@ -59,10 +63,13 @@ private:
     // под общим замком (DcReadGuard), поэтому состояние общее.
     struct Shown {
         uint64_t queued = 0, shown = 0;
+        uint64_t seenTick = 0;                 // прошлый взгляд на окно
         uint32_t signature = 0;
         bool known = false;
     };
     mutable Shown shown_[2][3]{};
+    mutable bool shownUnknown_ = false;
+    mutable uint32_t ambiguous_ = 0;
 
     uint64_t shownAddress(unsigned controller, unsigned index, uint64_t queued, uint32_t signature,
                           const volatile uint32_t* regs) const;
