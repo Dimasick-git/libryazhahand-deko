@@ -6,9 +6,9 @@
 
 namespace ryz::glass {
 
-// Буфер, который сейчас показывает дисплей. Регистры DC (только чтение) дают адрес окна сцены в адресном
-// пространстве SMMU дисплея; у VIC то же пространство (проверка по MC), поэтому буфер nvmap, закреплённый в канале
-// VIC, получает тот же адрес — по нему и ищется номер. Один поток владеет всеми закреплениями.
+// Буфер, который показывает дисплей. Регистры DC (только чтение) дают адрес окна сцены в адресном пространстве SMMU
+// дисплея; у VIC то же пространство (проверка по MC), поэтому буфер nvmap, закреплённый в канале VIC, получает тот же
+// адрес — по нему и ищется номер. Один поток владеет всеми закреплениями.
 class DirectCapture {
 public:
     // firstOwnId..latestOwnId — свои буферы (не трогать; верх поиска — последний), census — страница 0x1000 под
@@ -17,14 +17,18 @@ public:
     bool initialize(uint32_t firstOwnId, uint32_t latestOwnId, void* censusStorage, uint32_t overlayWidth,
                     uint32_t overlayHeight, const uint32_t* hints, unsigned hintCount);
     bool acquire(DirectFrame&);
-    // Из потока кадра: адрес, который дисплей показывает прямо сейчас, если он в том же буфере nvmap. Читает только
+    // Из потока кадра: адрес готового кадра окна сцены прямо сейчас, если он в том же буфере nvmap. Читает только
     // регистры окна (без SMC) — дёшево, каждый кадр.
     bool refreshAddress(DirectFrame&) const;
+    // Из потока захвата между полными чтениями: запрос защёлки и взведённый адрес окна сцены последнего кадра (без
+    // SMC), чтобы не проглядеть кадр, отданный на показ.
+    void watch() const;
     void close();
-    // Показанный адрес окна сцены сейчас неизвестен (см. shownAddress): поток захвата смотрит чаще, пока не узнает.
-    bool shownUnknown() const { return shownUnknown_; }
-    // Сколько раз дисплей мог защёлкнуть больше одного кадра между двумя взглядами — кадр тогда пропущен.
-    uint32_t ambiguousLatches() const { return ambiguous_; }
+    // Счётчики для журнала (см. committedAddress).
+    struct Stats {
+        uint32_t reads = 0, requested = 0, assemblyAhead = 0, armedEarly = 0, held = 0, unknown = 0;
+    };
+    Stats stats() const;
 
 private:
     struct Pin {
@@ -59,20 +63,27 @@ private:
     uint64_t lastAddress_ = 0;
     bool ready_ = false;
     void* censusStorage_ = nullptr;
-    // Что окно сейчас ПОКАЗЫВАЕТ (активный банк), выведенное без READ_MUX, — см. shownAddress. Оба потока читают
-    // под общим замком (DcReadGuard), поэтому состояние общее.
-    struct Shown {
-        uint64_t queued = 0, shown = 0;
-        uint64_t seenTick = 0;                 // прошлый взгляд на окно
+    // Окно сцены последнего найденного кадра — его смотрит watch().
+    unsigned watchController_ = 0, watchIndex_ = 0;
+    uint32_t watchSignature_ = 0;
+    bool watchValid_ = false;
+    // Готовый кадр окна по взведённой копии адреса (см. committedAddress). Оба потока читают под общим замком
+    // (DcReadGuard), поэтому состояние общее.
+    struct Track {
+        uint64_t last = 0, confirmed = 0;      // взведённый адрес прошлого взгляда; последний подтверждённый готовым
+        uint64_t idleSince = 0;                // с этого тика взведён новый адрес без запроса защёлки
         uint32_t signature = 0;
-        bool known = false;
+        bool lastFreshIdle = false;            // прошлый взгляд: новый адрес и защёлка не запрошена
     };
-    mutable Shown shown_[2][3]{};
-    mutable bool shownUnknown_ = false;
-    mutable uint32_t ambiguous_ = 0;
+    mutable Track track_[2][3]{};
+    mutable Stats stats_{};
+    // Взведённая копия не читается (всегда 0 при живом адресе сборки) — адрес из сборки, как раньше.
+    mutable bool armOff_ = false, armLogged_ = false, armSeen_ = false;
+    mutable uint32_t armZero_ = 0;
 
-    uint64_t shownAddress(unsigned controller, unsigned index, uint64_t queued, uint32_t signature,
-                          const volatile uint32_t* regs) const;
+    uint64_t armedAddress(const volatile uint32_t* regs, unsigned buffer, uint64_t assembly) const;
+    uint64_t committedAddress(unsigned controller, unsigned index, uint64_t armed, uint64_t assembly,
+                              uint32_t signature, const volatile uint32_t* regs) const;
     bool readFrame(DirectFrame&);
     bool matchKept(DirectFrame&);
     bool tryId(uint32_t id, DirectFrame&);

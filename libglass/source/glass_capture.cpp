@@ -24,10 +24,10 @@ constexpr unsigned CeilingEvery = 240;      // раз в столько пром
 Mutex g_dcReadMutex;
 
 // Регистры контроллера дисплея стекло только читает. Переключать DC_CMD_STATE_ACCESS (READ_MUX, слово 0x40), чтобы
-// читать активный банк вместо очереди, нельзя: бит общий с системным драйвером дисплея, и его чтение-правка-запись окна в
-// тот миг, когда бит переключён нами, откатывает ждущее обновление окна — слой мигает. Какой адрес на экране, выводится
-// из ожидания защёлки (shownAddress). Чтение двойное (сверяется повторным чтением), а оба наших потока читают по
-// очереди — снимок одного окна не перемешивается.
+// читать активный банк вместо сборки, нельзя: бит общий с системным драйвером дисплея, и его чтение-правка-запись окна в
+// тот миг, когда бит переключён нами, откатывает ждущее обновление окна — слой мигает. Готовый кадр берётся из взведённой
+// копии адреса (committedAddress). Чтение двойное (сверяется повторным чтением), а оба наших потока читают по очереди —
+// снимок одного окна не перемешивается.
 class DcReadGuard {
 public:
     DcReadGuard() { mutexLock(&g_dcReadMutex); }
@@ -52,48 +52,92 @@ bool sceneFormat(uint32_t f) { return f == 12 || f == 13 || f == 37 || f == 38; 
 // Окно для сверки: тот же слой, пока не сменились режим, формат и размер источника.
 uint32_t windowSignature(const DcWindow& w) { return w.options ^ (w.format << 8) ^ (w.srcX << 16) ^ w.srcY; }
 
+// Защёлку запрашивали после того, как кадр дорисован, а взводили раньше — столько раз увидеть, чтобы перестать верить
+// новому взведённому адресу без запроса (см. committedAddress).
+constexpr uint32_t ArmedEarlyTrust = 3;
+// Новый взведённый адрес без запроса защёлки дольше этого — запрос и защёлку проглядели, кадр уже на экране.
+constexpr uint64_t MissedLatchNs = 50'000'000;
+// Столько взглядов подряд взведённая копия читается нулём при живом адресе сборки — значит, она не читается вовсе.
+constexpr uint32_t ArmZeroLimit = 32;
+
 }  // namespace
 
-// Между двумя взглядами короче этого дисплей защёлкивает окно не больше одного раза: кадр длиннее и на 140 Гц.
-constexpr uint64_t OneLatchNs = 7'000'000;
+// Взведённая копия адреса окна: START_ADDR и START_ADDR_HI — слова buffer и buffer+13, их взведённые копии (_NS) —
+// словом следом, buffer+1 и buffer+14 (TRM 24.5.4: у регистров с тремя копиями взведённая лежит по адресу на единицу
+// больше). READ_MUX её чтение не трогает. 0 — копию взвели посреди чтения или она не читается.
+uint64_t DirectCapture::armedAddress(const volatile uint32_t* regs, unsigned buffer, uint64_t assembly) const {
+    if (armOff_) return assembly;
+    const uint32_t lo = regs[buffer + 1], hi = regs[buffer + 14];
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (lo != regs[buffer + 1] || hi != regs[buffer + 14]) return 0;
+    const uint64_t armed = uint64_t(lo) | (uint64_t(hi) << 32);
+    if (armed) {
+        armSeen_ = true;
+        armZero_ = 0;
+        return armed;
+    }
+    if (assembly && !armSeen_ && ++armZero_ >= ArmZeroLimit) {
+        armOff_ = true;
+        glass::log("glass: armed address copy reads 0, window address from the assembly copy");
+        return assembly;
+    }
+    return 0;
+}
 
-// Адрес, который окно показывает, а не тот, что ждёт в очереди, — без READ_MUX. Чтение без READ_MUX даёт банк сборки,
-// где новый адрес стоит раньше, чем его покажут. Защёлка окна ждёт, пока в DC_CMD_STATE_CONTROL (слово 0x41) стоит его
-// WIN_x_ACT_REQ или GENERAL_ACT_REQ; аппарат снимает бит на защёлке, регистр только читается. Не ждёт — очередь и показ
-// совпадают. Ждёт — показан прежний адрес очереди, но только если с прошлого взгляда прошло меньше кадра: иначе дисплей
-// мог защёлкнуть два кадра, и «прежний адрес очереди» — буфер, который игра уже рисует заново (в стекле — недорисованный
-// кадр, оно мерцает; так было на OLED, когда поток захвата опаздывал). Тогда показанный неизвестен, пока окно не перестанет
-// ждать или очередь не сменится при свежем взгляде. 0 — показанный неизвестен, этот раз пропустить.
-uint64_t DirectCapture::shownAddress(unsigned controller, unsigned index, uint64_t queued, uint32_t signature,
-                                     const volatile uint32_t* regs) const {
-    Shown& s = shown_[controller & 1][index % 3];
-    if (s.signature != signature) {   // другой слой в этом окне: прежняя история к нему не относится
-        s = Shown{};
-        s.signature = signature;
+// Кадр, который окно показывает или покажет следующим, — по взведённой копии адреса, без READ_MUX. У адреса буфера окна
+// три копии (TRM 24.5.4): сборка, взведённая и активная. Драйвер дисплея пишет следующий адрес в сборку заранее — кадр в
+// нём может ещё рисоваться (на OLED стекло ловило такие кадры из сборки и мерцало), — взводит его (WIN_x_UPDATE) и
+// просит защёлку (WIN_x_ACT_REQ: слово 0x41, бит 1 + номер окна), когда кадр дорисован; на ближайшей границе кадра
+// взведённое становится активным.
+//  - Защёлка запрошена: взведённый кадр готов и выйдет на экран следующим, свободным станет только после ещё одного.
+//  - Не запрошена: взведённое уже на экране.
+// Бывает, что адрес взводят заранее, а защёлку просят позже. Это видно так: новый взведённый адрес без запроса, при
+// следующем взгляде он же с запросом. Увидев это ArmedEarlyTrust раз, новому адресу без запроса не верим: на экране
+// прежний подтверждённый, а сменился взведённый адрес ещё раз — прежний взведённый уже на экране (следующий взводят только
+// после его защёлки). Новый адрес без запроса дольше MissedLatchNs — защёлку проглядели, он на экране. 0 — готовый кадр
+// ещё не известен, этот раз пропустить.
+uint64_t DirectCapture::committedAddress(unsigned controller, unsigned index, uint64_t armed, uint64_t assembly,
+                                         uint32_t signature, const volatile uint32_t* regs) const {
+    Track& t = track_[controller & 1][index % 3];
+    if (t.signature != signature) {   // другой слой в этом окне: прежняя история к нему не относится
+        t = Track{};
+        t.signature = signature;
     }
-    const uint64_t now = armGetSystemTick();
-    const bool fresh = s.seenTick && armTicksToNs(now - s.seenTick) < OneLatchNs;
-    s.seenTick = now;
-    const uint32_t waiting = regs[0x41] & (1u | (1u << (1 + index % 3)));
-    if (!waiting) {
-        s.queued = s.shown = queued;
-        s.known = true;
-        return queued;
-    }
-    if (!fresh) {
-        if (s.known) ++ambiguous_;
-        s.known = false;
-        s.queued = queued;
-        return 0;
-    }
-    if (queued != s.queued) {
-        if (s.queued) {
-            s.shown = s.queued;
-            s.known = true;
+    const bool requested = regs[0x41] & (1u << (1 + index % 3));
+    const bool fresh = armed != t.last;
+    if (requested && !fresh && t.lastFreshIdle) ++stats_.armedEarly;
+    ++stats_.reads;
+    if (requested) ++stats_.requested;
+    if (assembly != armed) ++stats_.assemblyAhead;
+    uint64_t result;
+    if (requested || stats_.armedEarly < ArmedEarlyTrust || (armed == t.confirmed && !fresh)) {
+        t.confirmed = armed;
+        t.idleSince = 0;
+        result = armed;
+    } else {
+        const uint64_t now = armGetSystemTick();
+        if (fresh) {
+            if (t.last && t.last != t.confirmed) t.confirmed = t.last;
+            t.idleSince = now;
+        } else if (!t.idleSince) {
+            t.idleSince = now;
         }
-        s.queued = queued;
+        if (armTicksToNs(now - t.idleSince) > MissedLatchNs) {
+            t.confirmed = armed;
+            t.idleSince = 0;
+        }
+        result = t.confirmed;
+        if (!result) ++stats_.unknown;
+        else if (result != armed) ++stats_.held;
     }
-    return s.known ? s.shown : 0;
+    t.last = armed;
+    t.lastFreshIdle = fresh && !requested;
+    return result;
+}
+
+DirectCapture::Stats DirectCapture::stats() const {
+    DcReadGuard guard;
+    return stats_;
 }
 
 bool DirectCapture::initialize(uint32_t firstOwnId, uint32_t latestOwnId, void* censusStorage, uint32_t overlayWidth,
@@ -140,7 +184,7 @@ bool DirectCapture::initialize(uint32_t firstOwnId, uint32_t latestOwnId, void* 
     }
     misses_ = 0;
     ready_ = true;
-    glass::log("glass: DC scanout capture, registers read-only, shown frame by the latch request");
+    glass::log("glass: DC scanout capture, registers read-only, frame from the armed address copy");
     return true;
 }
 
@@ -219,12 +263,16 @@ bool DirectCapture::readFrame(DirectFrame& result) {
             if (!w.srcX || !w.srcY || !w.extentX || !w.extentY) continue;
             if (!sceneFormat(w.format) || w.srcX < 64 || w.srcY < 64) continue;
             if (w.extentX < sw * 3 / 4 || w.extentY < sh * 3 / 4) continue;
-            // Из очереди — в то, что на экране.
-            windows[i].address = shownAddress(controller, i, w.address, windowSignature(w), regs);
-            if (!windows[i].address) {
-                shownUnknown_ = true;
-                continue;
+            const uint64_t armed = armedAddress(regs, buffer, w.address);
+            if (!armed) continue;
+            if (!armLogged_) {
+                armLogged_ = true;
+                glass::log("glass: scene window %c of DC %u: assembly 0x%llx, armed 0x%llx, latch request %u",
+                           char('A' + i), controller, (unsigned long long)w.address, (unsigned long long)armed,
+                           unsigned((regs[0x41] >> (1 + i)) & 1));
             }
+            windows[i].address = committedAddress(controller, i, armed, w.address, windowSignature(w), regs);
+            if (!windows[i].address) continue;
             sceneLike[i] = true;
         }
         int overlay = -1;
@@ -258,7 +306,6 @@ bool DirectCapture::readFrame(DirectFrame& result) {
                 frame.overlay = lastOverlay_;
                 frame.overlayFound = true;
             }
-            shownUnknown_ = false;
             result = frame;
             return true;
         }
@@ -352,6 +399,10 @@ bool DirectCapture::tryId(uint32_t id, DirectFrame& frame) {
 
 bool DirectCapture::acquire(DirectFrame& frame) {
     if (!ready_ || !readFrame(frame)) return false;
+    watchController_ = frame.scene.controller;
+    watchIndex_ = frame.scene.index;
+    watchSignature_ = windowSignature(frame.scene);
+    watchValid_ = true;
     if (matchKept(frame)) {
         misses_ = 0;
         return true;
@@ -413,11 +464,12 @@ bool DirectCapture::refreshAddress(DirectFrame& f) const {
     if (!f.overlayFound || f.overlay.controller != f.scene.controller || f.overlay.index > 2) return false;
     if (!windowMappingMatches(f.scene, regs) || !windowMappingMatches(f.overlay, regs)) return false;
     const unsigned buffer = 0xbc0 + f.scene.index * 0x200;
-    const uint64_t queued = uint64_t(regs[buffer]) | (uint64_t(regs[buffer + 13]) << 32);
+    const uint64_t assembly = uint64_t(regs[buffer]) | (uint64_t(regs[buffer + 13]) << 32);
+    const uint64_t armed = armedAddress(regs, buffer, assembly);
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (!windowMappingMatches(f.scene, regs) || !windowMappingMatches(f.overlay, regs) ||
-        uint32_t(queued) != regs[buffer] || uint32_t(queued >> 32) != regs[buffer + 13]) return false;
-    const uint64_t address = shownAddress(f.scene.controller, f.scene.index, queued, windowSignature(f.scene), regs);
+    if (!armed || !windowMappingMatches(f.scene, regs) || !windowMappingMatches(f.overlay, regs)) return false;
+    const uint64_t address =
+        committedAddress(f.scene.controller, f.scene.index, armed, assembly, windowSignature(f.scene), regs);
     if (!address) return false;
     if (address == f.scene.address) return true;
     // Другой буфер nvmap (свопчейн из отдельных буферов) — остаётся прежний, его найдёт поток.
@@ -430,7 +482,28 @@ bool DirectCapture::refreshAddress(DirectFrame& f) const {
     return true;
 }
 
+void DirectCapture::watch() const {
+    if (!ready_ || !watchValid_ || watchController_ > 1 || watchIndex_ > 2) return;
+    auto* regs = dc_[watchController_];
+    if (!regs || !clocks_ || !(clocks_[4] & (1u << (watchController_ ? 26 : 27)))) return;
+    DcReadGuard guard;
+    if (!(regs[0x032] & 0x60)) return;
+    const unsigned control = 0xb80 + watchIndex_ * 0x200, buffer = 0xbc0 + watchIndex_ * 0x200;
+    DcWindow w;
+    w.options = regs[control];
+    if (!(w.options & 0x40000000)) return;
+    w.format = regs[control + 3];
+    const uint32_t pre = regs[control + 6];
+    w.srcX = (pre & 0x7fff) / 4;
+    w.srcY = (pre >> 16) & 0x1fff;
+    if (windowSignature(w) != watchSignature_) return;   // в окне уже другой слой — его найдёт полное чтение
+    const uint64_t assembly = uint64_t(regs[buffer]) | (uint64_t(regs[buffer + 13]) << 32);
+    const uint64_t armed = armedAddress(regs, buffer, assembly);
+    if (armed) committedAddress(watchController_, watchIndex_, armed, assembly, watchSignature_, regs);
+}
+
 void DirectCapture::close() {
+    watchValid_ = false;
     if (vic_ != ~0u) {
         for (auto& p : kept_) release(p);
         nvClose(vic_);

@@ -135,6 +135,7 @@ struct State {
     bool captureThisFrame = false;
     bool capturePaused = false;
     unsigned captureChanges = 0;
+    unsigned liveFrames = 0, keptFrames = 0;   // кадры с живым фоном и с прежним размытием — для журнала
     DkMemBlock source = nullptr;
     u32 sourceId = 0;
     DkCmdList captureList = 0;
@@ -645,7 +646,8 @@ extern "C" void* ryzGpuBegin(u8* backgroundAlpha) {
     if (g.captureThisFrame) g.frame = candidate;
     const bool paused = g.cachedBlur && !g.captureThisFrame;
     if (paused != g.capturePaused && g.captureChanges++ < 8)
-        log(paused ? "glass: capture paused (plane changed), keeping last GPU blur" : "glass: live capture resumed");
+        log(paused ? "glass: capture paused (no committed frame or overlay plane), keeping last GPU blur"
+                   : "glass: live capture resumed");
     g.capturePaused = paused;
     g.haveFrame = g_enabled.load(std::memory_order_relaxed) && (g.captureThisFrame || g.cachedBlur);
     // Стекло решается до отрисовки: Tesla рисует фон темы с этой альфой, шейдер кладёт его на размытый кадр игры.
@@ -702,6 +704,10 @@ extern "C" void ryzGpuEnd(void) {
     g.queue.presentImage(g.swapchain, slot);
     g.inFlight = true;
     ++g.frames;
+    if (g.captureThisFrame) ++g.liveFrames;
+    else if (g.cachedBlur) ++g.keptFrames;
+    if (g.frames == 600 || g.frames == 3600)
+        log("glass: %u frames: live backdrop %u, last blur kept %u", g.frames, g.liveFrames, g.keptFrames);
 }
 
 // Зовётся из __appExit до fsdevUnmountAll: дальше журнал на карту не пишется.

@@ -12,11 +12,10 @@
 namespace ryz::glass::backdrop {
 namespace {
 
-constexpr u64 PeriodNs = 8'000'000;        // регистры DC — раз в ~8 мс: дисплей меняет буфер не чаще кадра
-// Показанный буфер неизвестен (защёлка ждёт, а прошлый взгляд старше кадра) — смотреть раз в миллисекунду, пока окно не
-// перестанет ждать или очередь не сменится при свежем взгляде; не дольше FastTries подряд.
-constexpr u64 FastNs = 1'000'000;
-constexpr unsigned FastTries = 50;
+constexpr u64 PeriodNs = 8'000'000;        // полное чтение регистров DC — раз в ~8 мс: дисплей меняет буфер не чаще кадра
+constexpr u64 WatchNs = 2'000'000;         // между ними — запрос защёлки окна сцены: отданный на показ кадр не проглядеть
+constexpr u64 StatsNs = 10'000'000'000;    // счётчики взведённой копии — в журнал раз в столько, пока оверлей виден
+constexpr unsigned StatsLines = 6;
 constexpr u64 IdleNs = 300'000'000;        // оверлей не рисует дольше — спрятан, искать незачем
 constexpr u64 FreshNs = 2'000'000'000;     // столько оверлей на экране без найденного кадра — фон убрать
 // Найденные номера буферов сцены — между запусками: пул HOME создаётся на загрузке и держит один номер до
@@ -74,8 +73,8 @@ void publish(const DirectFrame& f) {
 }
 
 void run(void*) {
-    unsigned misses = 0, fast = 0;
-    uint32_t ambiguousLogged = 0;
+    unsigned misses = 0, statsLines = 0;
+    u64 statsTick = armGetSystemTick();
     while (g_run.load(std::memory_order_acquire)) {
         if (nsSince(g_frameTick.load(std::memory_order_acquire)) > IdleNs) {
             svcSleepThread(50'000'000);
@@ -89,15 +88,20 @@ void run(void*) {
         } else if (++misses == 500) {
             glass::log("glass: display buffer not found in 500 tries");
         }
-        // Журнал — на 1, 2, 4, 8… случаях, не на каждом.
-        const uint32_t ambiguous = g_capture.ambiguousLatches();
-        if (ambiguous && ambiguous >= ambiguousLogged * 2) {
-            ambiguousLogged = ambiguous;
-            glass::log("glass: shown frame unclear %u times (latch pending, previous read over a frame ago), frames skipped",
-                       ambiguous);
+        if (statsLines < StatsLines && nsSince(statsTick) > StatsNs) {
+            statsTick = armGetSystemTick();
+            ++statsLines;
+            const DirectCapture::Stats s = g_capture.stats();
+            const u64 reads = s.reads ? s.reads : 1;
+            glass::log("glass: armed copy: %u reads, latch requested %u%%, assembly ahead %u%%, armed before request %u, "
+                       "previous frame held %u, unknown %u",
+                       s.reads, unsigned(u64(s.requested) * 100 / reads), unsigned(u64(s.assemblyAhead) * 100 / reads),
+                       s.armedEarly, s.held, s.unknown);
         }
-        fast = g_capture.shownUnknown() ? fast + 1 : 0;
-        svcSleepThread(fast && fast <= FastTries ? FastNs : PeriodNs);
+        for (u64 slept = 0; slept < PeriodNs && g_run.load(std::memory_order_acquire); slept += WatchNs) {
+            svcSleepThread(WatchNs);
+            g_capture.watch();
+        }
     }
 }
 
