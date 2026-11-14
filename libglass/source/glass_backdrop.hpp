@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Dimasick-git (RCU)
 #pragma once
 #include <cstdint>
 #include <switch.h>

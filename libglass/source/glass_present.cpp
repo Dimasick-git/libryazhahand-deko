@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Dimasick-git (RCU)
 // Стекло: вывод кадра Tesla через видеочип. См. glass_present.hpp.
 
 #include "glass_present.hpp"
@@ -471,8 +472,8 @@ ryz::glass::Affine captureMap(const backdrop::Frame& f) {
 
 }  // namespace
 
-/* Журнал молчит с выхода оверлея: фоновые потоки стекла (поиск буфера дисплея, подготовка) писали в него, когда
- * __appExit уже отмонтировал карту, — fclose падал в _close_r (Data Abort 0x18 в ovlloader, 08.11). */
+/* Журнал молчит с выхода оверлея: фоновые потоки стекла (поиск буфера дисплея, подготовка) пишут в него и тогда, когда
+ * __appExit уже отмонтировал карту, а fclose без карты падает в _close_r. */
 bool g_logQuiet = false;
 
 void log(const char* fmt, ...) {

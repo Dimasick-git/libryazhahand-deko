@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) 2026 Dimasick-git (RCU)
 // Сгенерировано libglass/tools/build_shaders.py из libglass/shaders — руками не править.
 #include "glass_shaders.hpp"
 
