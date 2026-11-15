@@ -72,6 +72,17 @@ void publish(const DirectFrame& f) {
     mutexUnlock(&g_mutex);
 }
 
+// Счётчики взведённой копии с начала показа — в журнал.
+void logStats(const char* when) {
+    const DirectCapture::Stats s = g_capture.stats();
+    if (!s.reads) return;
+    const u64 reads = s.reads;
+    glass::log("glass: armed copy %s: %u reads, latch requested %u%%, assembly ahead %u%%, armed before request %u, "
+               "scene switched %u",
+               when, s.reads, unsigned(u64(s.requested) * 100 / reads), unsigned(u64(s.assemblyAhead) * 100 / reads),
+               s.armedEarly, s.sceneSwitches);
+}
+
 void run(void*) {
     unsigned misses = 0, statsLines = 0;
     u64 statsTick = armGetSystemTick();
@@ -91,12 +102,7 @@ void run(void*) {
         if (statsLines < StatsLines && nsSince(statsTick) > StatsNs) {
             statsTick = armGetSystemTick();
             ++statsLines;
-            const DirectCapture::Stats s = g_capture.stats();
-            const u64 reads = s.reads ? s.reads : 1;
-            glass::log("glass: armed copy: %u reads, latch requested %u%%, assembly ahead %u%%, armed before request %u, "
-                       "previous frame held %u, unknown %u",
-                       s.reads, unsigned(u64(s.requested) * 100 / reads), unsigned(u64(s.assemblyAhead) * 100 / reads),
-                       s.armedEarly, s.held, s.unknown);
+            logStats("so far");
         }
         for (u64 slept = 0; slept < PeriodNs && g_run.load(std::memory_order_acquire); slept += WatchNs) {
             svcSleepThread(WatchNs);
@@ -134,6 +140,7 @@ void stop() {
     g_run.store(false, std::memory_order_release);
     threadWaitForExit(&g_thread);
     threadClose(&g_thread);
+    logStats("at exit");
     g_capture.close();
     g_started = false;
     mutexLock(&g_mutex);
@@ -149,6 +156,10 @@ void frameShown() {
 
 bool refresh(Frame& frame) {
     return g_started && g_capture.refreshAddress(frame);
+}
+
+uint32_t waitScanSafe(const Frame& frame) {
+    return g_started ? g_capture.waitScanSafe(frame.scene.controller, frame.scene.index) : 0;
 }
 
 bool latest(Frame& out) {

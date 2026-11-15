@@ -23,10 +23,14 @@ public:
     // Из потока захвата между полными чтениями: запрос защёлки и взведённый адрес окна сцены последнего кадра (без
     // SMC), чтобы не проглядеть кадр, отданный на показ.
     void watch() const;
+    // Из потока кадра, перед чтением адреса и захватом: если до конца активной части кадра дисплея осталось меньше
+    // запаса на захват (или идёт гашение), дождаться начала следующего кадра. Возвращает время ожидания в микросекундах
+    // (0 — ждать не пришлось).
+    uint32_t waitScanSafe(unsigned controller, unsigned index) const;
     void close();
     // Счётчики для журнала (см. committedAddress).
     struct Stats {
-        uint32_t reads = 0, requested = 0, assemblyAhead = 0, armedEarly = 0, held = 0, unknown = 0;
+        uint32_t reads = 0, requested = 0, assemblyAhead = 0, armedEarly = 0, sceneSwitches = 0;
     };
     Stats stats() const;
 
@@ -70,8 +74,7 @@ private:
     // Готовый кадр окна по взведённой копии адреса (см. committedAddress). Оба потока читают под общим замком
     // (DcReadGuard), поэтому состояние общее.
     struct Track {
-        uint64_t last = 0, confirmed = 0;      // взведённый адрес прошлого взгляда; последний подтверждённый готовым
-        uint64_t idleSince = 0;                // с этого тика взведён новый адрес без запроса защёлки
+        uint64_t last = 0;                     // взведённый адрес прошлого взгляда
         uint32_t signature = 0;
         bool lastFreshIdle = false;            // прошлый взгляд: новый адрес и защёлка не запрошена
     };
@@ -80,6 +83,15 @@ private:
     // Взведённая копия не читается (не похожа на адрес или ни разу не совпала со сборкой) — адрес из сборки.
     mutable bool armOff_ = false, armLogged_ = false, armSeen_ = false, armMatched_ = false;
     mutable uint32_t armZero_ = 0, armMismatch_ = 0;
+    // Счётчик развёртки не сошёлся с расчётом активной части кадра много раз подряд — захват ждёт только конца гашения.
+    mutable bool scanModelBad_ = false;
+    mutable uint32_t scanMisses_ = 0;
+    // Окно сцены прошлого найденного кадра — для счёта смен (журнал).
+    DcWindow lastScene_{};
+    bool haveScene_ = false;
+    unsigned sceneLogs_ = 0;
+
+    void noteScene(const DcWindow&);
 
     uint64_t armedAddress(const volatile uint32_t* regs, unsigned buffer, uint64_t assembly) const;
     uint64_t committedAddress(unsigned controller, unsigned index, uint64_t armed, uint64_t assembly,

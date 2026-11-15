@@ -52,15 +52,21 @@ bool sceneFormat(uint32_t f) { return f == 12 || f == 13 || f == 37 || f == 38; 
 // Окно для сверки: тот же слой, пока не сменились режим, формат и размер источника.
 uint32_t windowSignature(const DcWindow& w) { return w.options ^ (w.format << 8) ^ (w.srcX << 16) ^ w.srcY; }
 
-// Защёлку запрашивали после того, как кадр дорисован, а взводили раньше — столько раз увидеть, чтобы перестать верить
-// новому взведённому адресу без запроса (см. committedAddress).
-constexpr uint32_t ArmedEarlyTrust = 3;
-// Новый взведённый адрес без запроса защёлки дольше этого — запрос и защёлку проглядели, кадр уже на экране.
-constexpr uint64_t MissedLatchNs = 50'000'000;
 // Взведённая копия не читается: столько взглядов подряд она не похожа на адрес при живом адресе сборки, или столько
 // взглядов она ни разу не совпала со сборкой (сборка и взведённая расходятся лишь между записью адреса и его взводом).
 constexpr uint32_t ArmZeroLimit = 32;
 constexpr uint32_t ArmMatchLimit = 2400;
+// Защёлка окна срабатывает на границе кадра, в вертикальном гашении: взведённый буфер сцены выходит на экран, прежний
+// уходит обратно приложению, и в него сразу рисуют (на OLED слой HOME собирается в двух буферах). Адрес читается и
+// захват уходит на видеочип не ближе этой доли активной части к её концу — захват успевает раньше, чем буфер отдадут.
+constexpr uint32_t ScanGuardDivisor = 5;
+// Запас и гашение вместе — около 4 мс; дольше счётчик развёртки не ждать.
+constexpr uint64_t ScanWaitMaxNs = 6'000'000;
+// Строка без гашения на столько строк за расчётной активной частью — ещё не расхождение (граница считается по-разному).
+constexpr int32_t ScanSlackLines = 2;
+// Столько расхождений подряд — расчёт активной части не про этот дисплей, ждать только конца гашения.
+constexpr uint32_t ScanMissLimit = 16;
+constexpr uint64_t ScanSleepMinNs = 100'000, ScanSleepMaxNs = 4'000'000;
 
 }  // namespace
 
@@ -96,18 +102,15 @@ uint64_t DirectCapture::armedAddress(const volatile uint32_t* regs, unsigned buf
     return (assembly & ~0xffffffffull) | lo;
 }
 
-// Кадр, который окно показывает или покажет следующим, — по взведённой копии адреса, без READ_MUX. У адреса буфера окна
-// три копии (TRM 24.5.4): сборка, взведённая и активная. Драйвер дисплея пишет следующий адрес в сборку заранее — кадр в
-// нём может ещё рисоваться (на OLED стекло ловило такие кадры из сборки и мерцало), — взводит его (WIN_x_UPDATE) и
-// просит защёлку (WIN_x_ACT_REQ: слово 0x41, бит 1 + номер окна), когда кадр дорисован; на ближайшей границе кадра
-// взведённое становится активным.
-//  - Защёлка запрошена: взведённый кадр готов и выйдет на экран следующим, свободным станет только после ещё одного.
-//  - Не запрошена: взведённое уже на экране.
-// Бывает, что адрес взводят заранее, а защёлку просят позже. Это видно так: новый взведённый адрес без запроса, при
-// следующем взгляде он же с запросом. Увидев это ArmedEarlyTrust раз, новому адресу без запроса не верим: на экране
-// прежний подтверждённый, а сменился взведённый адрес ещё раз — прежний взведённый уже на экране (следующий взводят только
-// после его защёлки). Новый адрес без запроса дольше MissedLatchNs — защёлку проглядели, он на экране. 0 — готовый кадр
-// ещё не известен, этот раз пропустить.
+// Кадр окна сцены — по взведённой копии адреса, без READ_MUX. У адреса буфера окна три копии (TRM 24.5.4): сборка,
+// взведённая и активная. Драйвер дисплея пишет адрес, взводит его (WIN_x_UPDATE) и просит защёлку (WIN_x_ACT_REQ: слово
+// 0x41, бит 1 + номер окна); на ближайшей границе кадра взведённое становится активным. Взведённый кадр всегда дорисован:
+//  - защёлка запрошена — он выйдет на экран следующим и пробудет на нём кадр;
+//  - не запрошена — он уже на экране и уйдёт с него на границе после следующей защёлки.
+// Опасно не какой кадр брать, а когда: буфер, ушедший с экрана, отдают обратно, и в него сразу рисуют. Захват поэтому
+// уходит на видеочип сразу после чтения адреса и не у самой границы кадра (waitScanSafe). Прежний «подтверждённый» кадр
+// здесь больше не держится: когда защёлка проскакивала между двумя взглядами, он был уже отдан, и стекло мерцало
+// (glass.log 15.11: «previous frame held 438»). Счётчики — только для журнала.
 uint64_t DirectCapture::committedAddress(unsigned controller, unsigned index, uint64_t armed, uint64_t assembly,
                                          uint32_t signature, const volatile uint32_t* regs) const {
     Track& t = track_[controller & 1][index % 3];
@@ -121,30 +124,9 @@ uint64_t DirectCapture::committedAddress(unsigned controller, unsigned index, ui
     ++stats_.reads;
     if (requested) ++stats_.requested;
     if (assembly != armed) ++stats_.assemblyAhead;
-    uint64_t result;
-    if (requested || stats_.armedEarly < ArmedEarlyTrust || (armed == t.confirmed && !fresh)) {
-        t.confirmed = armed;
-        t.idleSince = 0;
-        result = armed;
-    } else {
-        const uint64_t now = armGetSystemTick();
-        if (fresh) {
-            if (t.last && t.last != t.confirmed) t.confirmed = t.last;
-            t.idleSince = now;
-        } else if (!t.idleSince) {
-            t.idleSince = now;
-        }
-        if (armTicksToNs(now - t.idleSince) > MissedLatchNs) {
-            t.confirmed = armed;
-            t.idleSince = 0;
-        }
-        result = t.confirmed;
-        if (!result) ++stats_.unknown;
-        else if (result != armed) ++stats_.held;
-    }
     t.last = armed;
     t.lastFreshIdle = fresh && !requested;
-    return result;
+    return armed;
 }
 
 DirectCapture::Stats DirectCapture::stats() const {
@@ -196,7 +178,8 @@ bool DirectCapture::initialize(uint32_t firstOwnId, uint32_t latestOwnId, void* 
     }
     misses_ = 0;
     ready_ = true;
-    glass::log("glass: DC scanout capture, registers read-only, frame from the armed address copy");
+    glass::log("glass: DC scanout capture, registers read-only, frame from the armed address copy, captured away from "
+               "the frame boundary");
     return true;
 }
 
@@ -411,6 +394,7 @@ bool DirectCapture::tryId(uint32_t id, DirectFrame& frame) {
 
 bool DirectCapture::acquire(DirectFrame& frame) {
     if (!ready_ || !readFrame(frame)) return false;
+    noteScene(frame.scene);
     watchController_ = frame.scene.controller;
     watchIndex_ = frame.scene.index;
     watchSignature_ = windowSignature(frame.scene);
@@ -512,6 +496,76 @@ void DirectCapture::watch() const {
     const uint64_t assembly = uint64_t(regs[buffer]) | (uint64_t(regs[buffer + 13]) << 32);
     const uint64_t armed = armedAddress(regs, buffer, assembly);
     if (armed) committedAddress(watchController_, watchIndex_, armed, assembly, watchSignature_, regs);
+}
+
+// Счётчик развёртки — DC_DISP_DISPLAY_DBG_TIMING (слово 0x4f6, только чтение): V_COUNT (биты 12:0) — строка от опорной
+// точки кадра, V_BLANK (бит 15) — вертикальное гашение. Активная часть начинается через V_REF_TO_SYNC + V_SYNC_WIDTH +
+// V_BACK_PORCH строк (слова 0x406..0x408, биты 28:16; задний порог — дополнительный код) и длится V_DISP_ACTIVE (0x409);
+// последняя строка кадра — конец активной части + V_FRONT_PORCH (0x40a) − V_REF_TO_SYNC. Защёлка уже запрошена —
+// взведённый кадр выйдет на экран на ближайшей границе и пробудет на нём целый кадр: ждать незачем.
+uint32_t DirectCapture::waitScanSafe(unsigned controller, unsigned index) const {
+    if (!ready_ || controller > 1 || index > 2) return 0;
+    auto* regs = dc_[controller];
+    if (!regs || !clocks_ || !(clocks_[4] & (1u << (controller ? 26 : 27)))) return 0;
+    if ((regs[0x032] & 0x60) != 0x20) return 0;   // не непрерывный вывод — счётчик сам не идёт
+    if (regs[0x41] & (1u << (1 + index))) return 0;
+    const int32_t refToSync = int32_t((regs[0x406] >> 16) & 0x1fff), syncWidth = int32_t((regs[0x407] >> 16) & 0x1fff);
+    int32_t backPorch = int32_t((regs[0x408] >> 16) & 0x1fff);
+    if (backPorch & 0x1000) backPorch -= 0x2000;
+    const int32_t activeLines = int32_t((regs[0x409] >> 16) & 0x1fff), frontPorch = int32_t((regs[0x40a] >> 16) & 0x1fff);
+    const int32_t activeStart = refToSync + syncWidth + backPorch, activeEnd = activeStart + activeLines;
+    const int32_t totalLines = activeEnd + frontPorch - refToSync + 1;
+    if (activeStart < 0 || activeLines < 16 || totalLines <= activeEnd) return 0;
+    const int32_t guard = activeLines / int32_t(ScanGuardDivisor);
+    const uint64_t lineNs = 16'666'667ull / uint64_t(totalLines);   // 60 Гц; у других частот сон лишь неточнее
+    const uint64_t start = armGetSystemTick();
+    bool waited = false;
+    for (;;) {
+        const uint32_t timing = regs[0x4f6];
+        const int32_t line = int32_t(timing & 0x1fff);
+        if (!(timing & 0x8000)) {
+            if (line < activeStart - ScanSlackLines || line > activeEnd + ScanSlackLines) {
+                if (++scanMisses_ >= ScanMissLimit && !scanModelBad_) {
+                    scanModelBad_ = true;
+                    glass::log("glass: scan line %d outside the active part %d..%d %u times, waiting only for the blank "
+                               "to end", line, activeStart, activeEnd, scanMisses_);
+                }
+                break;
+            }
+            scanMisses_ = 0;
+            if (scanModelBad_ || line + guard < activeEnd) break;
+        }
+        if (armTicksToNs(armGetSystemTick() - start) > ScanWaitMaxNs) break;
+        // До начала следующей активной части — одним сном (и проверка).
+        const int32_t remaining = line < activeStart ? activeStart - line : totalLines - line + activeStart;
+        uint64_t sleepNs = uint64_t(remaining > 0 ? remaining : 1) * lineNs;
+        if (sleepNs < ScanSleepMinNs) sleepNs = ScanSleepMinNs;
+        if (sleepNs > ScanSleepMaxNs) sleepNs = ScanSleepMaxNs;
+        svcSleepThread(sleepNs);
+        waited = true;
+    }
+    return waited ? uint32_t(armTicksToNs(armGetSystemTick() - start) / 1000) : 0;
+}
+
+// Сцена сменила окно или слой в нём: счёт для журнала и первые смены подробно — фон, скачущий между двумя слоями, стекло
+// показало бы их чередованием.
+void DirectCapture::noteScene(const DcWindow& w) {
+    const bool changed = haveScene_ && (w.controller != lastScene_.controller || w.index != lastScene_.index ||
+                                        windowSignature(w) != windowSignature(lastScene_));
+    if (changed) {
+        {
+            DcReadGuard guard;
+            ++stats_.sceneSwitches;
+        }
+        if (sceneLogs_ < 6) {
+            ++sceneLogs_;
+            glass::log("glass: scene moved: window %c of DC %u (%ux%u, depth %u) -> window %c of DC %u (%ux%u, depth %u)",
+                       char('A' + lastScene_.index), lastScene_.controller, lastScene_.srcX, lastScene_.srcY,
+                       lastScene_.depth, char('A' + w.index), w.controller, w.srcX, w.srcY, w.depth);
+        }
+    }
+    lastScene_ = w;
+    haveScene_ = true;
 }
 
 void DirectCapture::close() {

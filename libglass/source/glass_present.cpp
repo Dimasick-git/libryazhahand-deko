@@ -136,6 +136,7 @@ struct State {
     bool capturePaused = false;
     unsigned captureChanges = 0;
     unsigned liveFrames = 0, keptFrames = 0;   // кадры с живым фоном и с прежним размытием — для журнала
+    unsigned scanWaits = 0, scanWaitMaxUs = 0; // кадры, где захват ждал начала кадра дисплея, и самое долгое ожидание
     DkMemBlock source = nullptr;
     u32 sourceId = 0;
     DkCmdList captureList = 0;
@@ -662,8 +663,17 @@ extern "C" void ryzGpuEnd(void) {
         return;
     }
     g.uiMem.flushCpuCache(0, g.uiBytes);
+    // Адрес буфера сцены перечитывается прямо перед захватом и не у самой границы кадра дисплея: на ней защёлка окна
+    // отдаёт прежний буфер обратно, и в него сразу рисуют (backdrop::waitScanSafe).
+    if (g.captureThisFrame) {
+        const unsigned waitedUs = backdrop::waitScanSafe(g.frame);
+        if (waitedUs) {
+            ++g.scanWaits;
+            if (waitedUs > g.scanWaitMaxUs) g.scanWaitMaxUs = waitedUs;
+        }
+        if (!backdrop::refresh(g.frame)) g.captureThisFrame = false;
+    }
     // Параметры: видеочип прошлый кадр закончил (ryzGpuBegin), блоки некэшируемые — пишутся сразу.
-    if (g.captureThisFrame && !backdrop::refresh(g.frame)) g.captureThisFrame = false;
     g.haveFrame = g_enabled.load(std::memory_order_relaxed) && (g.captureThisFrame || g.cachedBlur);
     Params params{};
     params.panel[0] = 1.0f / float(g_job.width);
@@ -687,15 +697,18 @@ extern "C" void ryzGpuEnd(void) {
         };
         std::memcpy(g.captureParamMem.getCpuAddr(), &cp, sizeof(cp));
     }
+    // Захват уходит на видеочип сразу, до acquireImage: за ним в очереди встаёт ожидание освобождения образа свопчейна
+    // (а то и сам вызов ждёт) — это следующая граница кадра, и захват читал бы буфер сцены, который на ней уже отдали
+    // обратно (на OLED стекло от этого мерцало). Композит интерфейса — после, поверх готового фона.
+    if (g.captureThisFrame && g.captureList) {
+        g.queue.submitCommands(g.captureList);
+        g.queue.flush();
+        g.cachedBlur = true;
+    }
     const int slot = g.queue.acquireImage(g.swapchain);
     if (slot < 0 || slot >= int(SwapImages)) {
         lose("bad swapchain slot");
         return;
-    }
-    // Сначала фон из буфера дисплея (живой, каждый кадр), потом композит интерфейса поверх него.
-    if (g.captureThisFrame && g.captureList) {
-        g.queue.submitCommands(g.captureList);
-        g.cachedBlur = true;
     }
     g.queue.submitCommands(g.lists[slot]);
     // Метка конца переноса — до вывода: presentImage отправляет видеочипу всё накопленное, и её тоже. Поставленная
@@ -707,7 +720,8 @@ extern "C" void ryzGpuEnd(void) {
     if (g.captureThisFrame) ++g.liveFrames;
     else if (g.cachedBlur) ++g.keptFrames;
     if (g.frames == 600 || g.frames == 3600)
-        log("glass: %u frames: live backdrop %u, last blur kept %u", g.frames, g.liveFrames, g.keptFrames);
+        log("glass: %u frames: live backdrop %u, last blur kept %u, waited for the frame start %u (max %u us)", g.frames,
+            g.liveFrames, g.keptFrames, g.scanWaits, g.scanWaitMaxUs);
 }
 
 // Зовётся из __appExit до fsdevUnmountAll: дальше журнал на карту не пишется.
@@ -720,6 +734,9 @@ extern "C" void ryzGlassLogQuiet(void) {
 extern "C" void ryzGpuExit(void) {
     if (!g_job.started) return;
     join();
+    if (g.frames)
+        log("glass: exit after %u frames: live backdrop %u, last blur kept %u, waited for the frame start %u (max %u us)",
+            g.frames, g.liveFrames, g.keptFrames, g.scanWaits, g.scanWaitMaxUs);
     destroy();
     if (g_job.attached && ryz::glass::heap::inUse())
         log("exit: %u KiB of GPU memory still held", unsigned(ryz::glass::heap::inUse() >> 10));
