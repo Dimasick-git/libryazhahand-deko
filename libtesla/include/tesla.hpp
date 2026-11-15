@@ -2277,6 +2277,10 @@ namespace tsl {
              * @param color Color
              */
             inline void drawRectMultiThreaded(const s32 x, const s32 y, const s32 w, const s32 h, const Color& color) {
+#ifdef RCU_SERIAL_RENDERING
+                drawRect(x, y, w, h, color);
+                return;
+#endif
                 // Early exit for invalid dimensions
                 if (w <= 0 || h <= 0) return;
                 
@@ -3453,6 +3457,10 @@ namespace tsl {
              * @param color Color
              */
             inline void drawRoundedRectMultiThreaded(const s32 x, const s32 y, const s32 w, const s32 h, const s32 radius, const Color& color) {
+#ifdef RCU_SERIAL_RENDERING
+                drawRoundedRectSingleThreaded(x, y, w, h, radius, color);
+                return;
+#endif
                 if (w <= 0 || h <= 0) return;
                 
                 // Calculate clipped bounds for early exit check
@@ -3785,6 +3793,10 @@ namespace tsl {
 
             template<typename Fn>
             static void dispatchRowChunks(u32 totalRows, Fn fn) {
+#ifdef RCU_SERIAL_RENDERING
+                if (totalRows != 0) fn(0u, totalRows);
+                return;
+#endif
                 const u32 n     = ult::numThreads;
                 const u32 chunk = (totalRows + n - 1u) / n;
                 u32 launched = 0u;
@@ -3942,7 +3954,13 @@ namespace tsl {
                 const u8 globalAlphaLimit = static_cast<u8>(0xF * opacity);
 
                 // Narrow images: single-threaded to avoid thread-spawn overhead.
-                if (imageW < 448u) {
+#ifdef RCU_SERIAL_RENDERING
+                // The serial path must not wait on the multi-worker barrier.
+                constexpr bool serialBitmap = true;
+#else
+                constexpr bool serialBitmap = false;
+#endif
+                if (serialBitmap || imageW < 448u) {
                     processBMPChunk(x, y, imageW, preprocessedData, 0, imageH, globalAlphaLimit, false, preserveAlpha);
                     return;
                 }
