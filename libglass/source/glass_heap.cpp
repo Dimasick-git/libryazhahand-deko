@@ -64,13 +64,20 @@ std::size_t reserve(std::size_t need) {
     need = (need + Granularity - 1) & ~(Granularity - 1);
     const std::size_t want = need > ExtraWant ? need : ExtraWant;
     if (g_count) return fail("already reserved");
-    if (!envHasHeapOverride()) return fail("no heap override from the loader");
+    // Оверлей nx-ovlloader живёт в куче загрузчика. Системный апплет (IS_OVERLAY_APPLET_DIRECTIVE, ExeFS) кучу ставит
+    // сам libnx (__nx_heap_size): newlib кончается на fake_heap_end, прибавка встаёт сразу за ним так же.
+    const bool loaderHeap = envHasHeapOverride();
+#if !IS_OVERLAY_APPLET_DIRECTIVE
+    if (!loaderHeap) return fail("no heap override from the loader");
+#endif
     u64 base = 0, region = 0;
     if (R_FAILED(svcGetInfo(&base, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0)) ||
         R_FAILED(svcGetInfo(&region, InfoType_HeapRegionSize, CUR_PROCESS_HANDLE, 0)))
         return fail("heap region unknown");
     // Куча оверлея — хвост кучи процесса, newlib кончается там же: только тогда прибавка встаёт сразу за ней.
-    const std::uintptr_t tail = reinterpret_cast<std::uintptr_t>(envGetHeapOverrideAddr()) + envGetHeapOverrideSize();
+    const std::uintptr_t tail = loaderHeap
+        ? reinterpret_cast<std::uintptr_t>(envGetHeapOverrideAddr()) + envGetHeapOverrideSize()
+        : reinterpret_cast<std::uintptr_t>(fake_heap_end);
     if (reinterpret_cast<std::uintptr_t>(fake_heap_end) != tail || tail <= base)
         return fail("newlib ends at 0x%llx, overlay heap at 0x%llx", (unsigned long long)(uintptr_t)fake_heap_end, tail);
     const std::size_t original = tail - base;

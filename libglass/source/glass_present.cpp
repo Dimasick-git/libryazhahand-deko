@@ -505,7 +505,12 @@ void configure() {
     // «Размытие GPU» выключено в настройках темы меню — оверлей как без стекла: кадры через libnx.
     const bool requested = ult::parseValueFromIniSection(ult::RYZHAND_CONFIG_INI_PATH, ult::RYZHAND_PROJECT_NAME, "glass_blur") != "false";
     g_enabled.store(requested, std::memory_order_relaxed);
+#if IS_OVERLAY_APPLET_DIRECTIVE
+    // Системный апплет не перезапускается до выключения консоли: видеочип готовим и при выключенном «Размытии GPU»,
+    // переключатель в Ryzhand потом включает стекло на лету (ryzGlassSetEnabled).
+#else
     if (!requested) return;
+#endif
     const u32 width = ult::DefaultFramebufferWidth ? ult::DefaultFramebufferWidth : 448;
     const u32 height = ult::DefaultFramebufferHeight ? ult::DefaultFramebufferHeight : 720;
     const std::size_t extra = heap::reserve(gpuBytesFor(width, height));
