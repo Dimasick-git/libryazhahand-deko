@@ -77,9 +77,9 @@ private:
     };
     mutable Track track_[2][3]{};
     mutable Stats stats_{};
-    // Взведённая копия не читается (всегда 0 при живом адресе сборки) — адрес из сборки, как раньше.
-    mutable bool armOff_ = false, armLogged_ = false, armSeen_ = false;
-    mutable uint32_t armZero_ = 0;
+    // Взведённая копия не читается (не похожа на адрес или ни разу не совпала со сборкой) — адрес из сборки.
+    mutable bool armOff_ = false, armLogged_ = false, armSeen_ = false, armMatched_ = false;
+    mutable uint32_t armZero_ = 0, armMismatch_ = 0;
 
     uint64_t armedAddress(const volatile uint32_t* regs, unsigned buffer, uint64_t assembly) const;
     uint64_t committedAddress(unsigned controller, unsigned index, uint64_t armed, uint64_t assembly,

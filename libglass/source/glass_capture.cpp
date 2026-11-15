@@ -57,31 +57,43 @@ uint32_t windowSignature(const DcWindow& w) { return w.options ^ (w.format << 8)
 constexpr uint32_t ArmedEarlyTrust = 3;
 // Новый взведённый адрес без запроса защёлки дольше этого — запрос и защёлку проглядели, кадр уже на экране.
 constexpr uint64_t MissedLatchNs = 50'000'000;
-// Столько взглядов подряд взведённая копия читается нулём при живом адресе сборки — значит, она не читается вовсе.
+// Взведённая копия не читается: столько взглядов подряд она не похожа на адрес при живом адресе сборки, или столько
+// взглядов она ни разу не совпала со сборкой (сборка и взведённая расходятся лишь между записью адреса и его взводом).
 constexpr uint32_t ArmZeroLimit = 32;
+constexpr uint32_t ArmMatchLimit = 2400;
 
 }  // namespace
 
-// Взведённая копия адреса окна: START_ADDR и START_ADDR_HI — слова buffer и buffer+13, их взведённые копии (_NS) —
-// словом следом, buffer+1 и buffer+14 (TRM 24.5.4: у регистров с тремя копиями взведённая лежит по адресу на единицу
-// больше). READ_MUX её чтение не трогает. 0 — копию взвели посреди чтения или она не читается.
+// Взведённая копия адреса окна: START_ADDR — слово buffer, его взведённая копия (START_ADDR_NS) — словом следом,
+// buffer+1 (TRM 24.5.4: у регистров с тремя копиями взведённая лежит по адресу на единицу больше). READ_MUX её чтение не
+// трогает. Старшие биты (START_ADDR_HI, buffer+13) — из сборки: между кадрами они не меняются. 0 — копию взвели посреди
+// чтения или она не читается.
 uint64_t DirectCapture::armedAddress(const volatile uint32_t* regs, unsigned buffer, uint64_t assembly) const {
     if (armOff_) return assembly;
-    const uint32_t lo = regs[buffer + 1], hi = regs[buffer + 14];
+    const uint32_t lo = regs[buffer + 1];
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (lo != regs[buffer + 1] || hi != regs[buffer + 14]) return 0;
-    const uint64_t armed = uint64_t(lo) | (uint64_t(hi) << 32);
-    if (armed) {
-        armSeen_ = true;
-        armZero_ = 0;
-        return armed;
+    if (lo != regs[buffer + 1]) return 0;
+    if (!lo || (lo & 0xf)) {   // не адрес буфера: START_ADDR кратен 16
+        if (assembly && !armSeen_ && ++armZero_ >= ArmZeroLimit) {
+            armOff_ = true;
+            glass::log("glass: armed address copy is not an address (0x%x), window address from the assembly copy", lo);
+            return assembly;
+        }
+        return 0;
     }
-    if (assembly && !armSeen_ && ++armZero_ >= ArmZeroLimit) {
-        armOff_ = true;
-        glass::log("glass: armed address copy reads 0, window address from the assembly copy");
-        return assembly;
+    armSeen_ = true;
+    armZero_ = 0;
+    if (!armMatched_) {
+        if (lo == uint32_t(assembly)) {
+            armMatched_ = true;
+        } else if (++armMismatch_ >= ArmMatchLimit) {
+            armOff_ = true;
+            glass::log("glass: armed address copy never matched the assembly copy (0x%x vs 0x%llx), assembly copy used",
+                       lo, (unsigned long long)assembly);
+            return assembly;
+        }
     }
-    return 0;
+    return (assembly & ~0xffffffffull) | lo;
 }
 
 // Кадр, который окно показывает или покажет следующим, — по взведённой копии адреса, без READ_MUX. У адреса буфера окна
